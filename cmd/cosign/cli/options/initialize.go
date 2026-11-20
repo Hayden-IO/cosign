@@ -22,10 +22,11 @@ import (
 
 // InitializeOptions is the top level wrapper for the initialize command.
 type InitializeOptions struct {
-	Mirror       string
-	Root         string
-	RootChecksum string
-	Staging      bool
+	Mirror                 string
+	Root                   string
+	RootChecksum           string
+	Staging                bool
+	ExperimentalPQCStaging bool
 }
 
 var _ Interface = (*InitializeOptions)(nil)
@@ -44,4 +45,12 @@ func (o *InitializeOptions) AddFlags(cmd *cobra.Command) {
 
 	cmd.Flags().BoolVar(&o.Staging, "staging", false,
 		"use the staging TUF repository")
+
+	cmd.Flags().BoolVar(&o.ExperimentalPQCStaging, "experimental-pqc-staging", false,
+		"EXPERIMENTAL: use the PQC staging TUF repository. This feature is experimental and subject to breaking changes without notice")
+
+	cmd.MarkFlagsMutuallyExclusive("staging", "experimental-pqc-staging")
+	cmd.MarkFlagsMutuallyExclusive("experimental-pqc-staging", "mirror")
+	cmd.MarkFlagsMutuallyExclusive("experimental-pqc-staging", "root")
+	cmd.MarkFlagsMutuallyExclusive("experimental-pqc-staging", "root-checksum")
 }

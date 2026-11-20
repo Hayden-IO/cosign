@@ -15,12 +15,15 @@
 package cosign
 
 import (
+	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/sigstore/cosign/v3/internal/useragent"
 	"github.com/sigstore/cosign/v3/pkg/cosign/env"
@@ -28,6 +31,20 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/theupdateframework/go-tuf/v2/metadata/fetcher"
 )
+
+// StagingPQCMirror is the TUF mirror URL for the experimental PQC staging instance.
+// TODO: Remove StagingPQCMirror and StagingPQCRoot once sigstore/sigstore-go#703 merges
+// and use tuf.StagingPQCMirror and tuf.StagingPQCRoot() directly.
+const StagingPQCMirror = "https://tuf.v2.sigstage.dev"
+
+//go:embed pqc_staging_root.json
+var embeddedStagingPQCRoot []byte
+
+// StagingPQCRoot returns a copy of the embedded initial root.json for the PQC staging instance.
+// TODO: Replace with tuf.StagingPQCRoot() once sigstore/sigstore-go#703 merges.
+func StagingPQCRoot() []byte {
+	return bytes.Clone(embeddedStagingPQCRoot)
+}
 
 func TrustedRoot() (root.TrustedMaterial, error) {
 	return TrustedRootWithContext(context.Background())
@@ -78,7 +95,7 @@ func SigningConfigRekorV2() (*root.SigningConfig, error) {
 // The cache directory is provided by the user as an environment variable TUF_ROOT, or the default $HOME/.sigstore/root is used.
 // The mirror URL is provided by the user as an environment variable TUF_MIRROR. If not overridden by the user, the value set during `cosign initialize` in remote.json in the cache directory is used.
 // If the mirror happens to be the sigstore.dev production TUF CDN, the options are returned since it is safe to use all the default settings.
-// If the mirror is a custom mirror, we try to find a cached root.json. We must not use the default embedded root.json.
+// For other mirrors, root.json is resolved in order from TUF_ROOT_JSON, the cached root.json, or (for StagingPQCMirror) the embedded PQC staging root. We must not use the default embedded prod root.json for custom mirrors.
 // If the TUF options cannot be found through these steps, the caller should not try to use this TUF client to fetch the trusted root and should instead fall back to the legacy TUF client to fetch individual trusted keys.
 func setTUFOpts() (*tuf.Options, error) {
 	opts := tuf.DefaultOptions()
@@ -95,7 +112,8 @@ func setTUFOpts() (*tuf.Options, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error setting TUF mirror: %w", err)
 	}
-	if opts.RepositoryBaseURL == tuf.DefaultMirror {
+	opts.RepositoryBaseURL = strings.TrimRight(opts.RepositoryBaseURL, "/")
+	if opts.RepositoryBaseURL == strings.TrimRight(tuf.DefaultMirror, "/") {
 		// Using the default mirror, so just use the embedded root.json.
 		return opts, nil
 	}
@@ -147,6 +165,10 @@ func setTUFRootJSON(opts *tuf.Options) error {
 			return fmt.Errorf("error reading cached root.json")
 		}
 		opts.Root = rootJSONBytes
+		return nil
+	}
+	if strings.TrimRight(opts.RepositoryBaseURL, "/") == strings.TrimRight(StagingPQCMirror, "/") {
+		opts.Root = StagingPQCRoot()
 		return nil
 	}
 	return fmt.Errorf("could not find cached root.json")

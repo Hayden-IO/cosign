@@ -17,11 +17,15 @@ package bundle
 import (
 	"bytes"
 	"context"
+	"crypto/mldsa"
 	"crypto/x509"
 	"testing"
+	"time"
 
 	"github.com/sigstore/cosign/v3/internal/test"
+	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
+	"github.com/sigstore/sigstore/pkg/signature"
 )
 
 func TestLocalCertChainProvider_GetCertificateChain(t *testing.T) {
@@ -117,4 +121,39 @@ func TestLocalCertChainProvider_GetCertificateChain(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestVerifyTrustedMaterialPublicKeyVerifiers(t *testing.T) {
+	t.Run("nil keyTrustedMaterial", func(t *testing.T) {
+		v := &verifyTrustedMaterial{}
+		if got := v.PublicKeyVerifiers(); got != nil {
+			t.Fatalf("expected nil verifiers, got %v", got)
+		}
+		if _, err := v.PublicKeyVerifier("hint"); err == nil {
+			t.Fatal("expected error from PublicKeyVerifier when keyTrustedMaterial is nil")
+		}
+	})
+
+	t.Run("delegates to keyTrustedMaterial", func(t *testing.T) {
+		priv, err := mldsa.GenerateKey(mldsa.MLDSA44())
+		if err != nil {
+			t.Fatalf("mldsa.GenerateKey: %v", err)
+		}
+		verifier, err := signature.LoadDefaultVerifier(priv.Public())
+		if err != nil {
+			t.Fatalf("LoadDefaultVerifier: %v", err)
+		}
+		key := root.NewExpiringKey(verifier, time.Time{}, time.Time{})
+		v := &verifyTrustedMaterial{
+			keyTrustedMaterial: root.NewTrustedPublicKeyVerifiers(key),
+		}
+
+		verifiers := v.PublicKeyVerifiers()
+		if len(verifiers) != 1 {
+			t.Fatalf("expected 1 verifier, got %d", len(verifiers))
+		}
+		if verifiers[0] != key {
+			t.Fatalf("expected delegated verifier to match original key")
+		}
+	})
 }

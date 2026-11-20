@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -47,7 +48,27 @@ func newKey() (*metadata.Key, signature.Signer, error) {
 	return public, signer, nil
 }
 
+func newMLDSAKey() (*metadata.Key, signature.Signer, error) {
+	private, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		return nil, nil, err
+	}
+	public, err := metadata.KeyFromPublicKey(private.Public())
+	if err != nil {
+		return nil, nil, err
+	}
+	signer, err := signature.LoadSigner(private, crypto.Hash(0))
+	if err != nil {
+		return nil, nil, err
+	}
+	return public, signer, nil
+}
+
 func newTUF(td string, targetList map[string][]byte) error {
+	return newTUFWithKeyGen(td, targetList, newKey)
+}
+
+func newTUFWithKeyGen(td string, targetList map[string][]byte, keyGen func() (*metadata.Key, signature.Signer, error)) error {
 	expiration := time.Now().AddDate(0, 0, 1).UTC()
 	targets := metadata.Targets(expiration)
 	targetsDir := filepath.Join(td, "targets")
@@ -71,7 +92,7 @@ func newTUF(td string, targetList map[string][]byte) error {
 	timestamp := metadata.Timestamp(expiration)
 	root := metadata.Root(expiration)
 	root.Signed.ConsistentSnapshot = false
-	public, signer, err := newKey()
+	public, signer, err := keyGen()
 	if err != nil {
 		return err
 	}
@@ -226,4 +247,125 @@ func TestDoInitialize(t *testing.T) {
 			assert.FileExists(t, filepath.Join(tufCache, "remote.json"))
 		})
 	}
+}
+
+func TestDoInitializeMLDSA(t *testing.T) {
+	tufRepo := t.TempDir()
+	targets := map[string][]byte{
+		"trusted_root.json":        []byte(`{"mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1"}`),
+		"signing_config.v0.2.json": []byte(`{"mediaType": "application/vnd.dev.sigstore.signingconfig.v0.2+json"}`),
+	}
+	if err := newTUFWithKeyGen(tufRepo, targets, newMLDSAKey); err != nil {
+		t.Fatal(err)
+	}
+	tufServer := httptest.NewServer(http.FileServer(http.Dir(tufRepo)))
+	t.Cleanup(tufServer.Close)
+
+	rootJSONPath := filepath.Join(tufRepo, "1.root.json")
+	rootBytes, err := os.ReadFile(rootJSONPath)
+	assert.NoError(t, err)
+
+	t.Run("explicit root with ML-DSA TUF repo", func(t *testing.T) {
+		tufCache := t.TempDir()
+		t.Setenv("TUF_ROOT", tufCache)
+
+		gotStdOut, gotStdErr, gotErr := captureOutput(func() error {
+			return DoInitialize(context.Background(), rootJSONPath, tufServer.URL)
+		})
+		assert.NoError(t, gotErr)
+		assert.Empty(t, gotStdOut)
+		assert.Empty(t, gotStdErr)
+
+		mirrorDir, _ := strings.CutPrefix(tufServer.URL, "http://")
+		mirrorDir = strings.ReplaceAll(mirrorDir, "/", "-")
+		mirrorDir = strings.ReplaceAll(mirrorDir, ":", "-")
+		assert.FileExists(t, filepath.Join(tufCache, mirrorDir, "root.json"))
+		assert.FileExists(t, filepath.Join(tufCache, mirrorDir, "targets", "trusted_root.json"))
+		assert.FileExists(t, filepath.Join(tufCache, mirrorDir, "targets", "signing_config.v0.2.json"))
+		remoteBytes, err := os.ReadFile(filepath.Join(tufCache, "remote.json"))
+		assert.NoError(t, err)
+		assert.Contains(t, string(remoteBytes), tufServer.URL)
+	})
+
+	t.Run("DoInitializeStagingPQC initializes with embedded PQC root", func(t *testing.T) {
+		origMirror, origRoot := stagingPQCMirror, stagingPQCRoot
+		stagingPQCMirror = tufServer.URL
+		stagingPQCRoot = func() []byte { return rootBytes }
+		t.Cleanup(func() {
+			stagingPQCMirror = origMirror
+			stagingPQCRoot = origRoot
+		})
+
+		tufCache := t.TempDir()
+		t.Setenv("TUF_ROOT", tufCache)
+
+		_, _, gotErr := captureOutput(func() error {
+			return DoInitializeStagingPQC(context.Background())
+		})
+		assert.NoError(t, gotErr)
+
+		mirrorDir, _ := strings.CutPrefix(tufServer.URL, "http://")
+		mirrorDir = strings.ReplaceAll(mirrorDir, "/", "-")
+		mirrorDir = strings.ReplaceAll(mirrorDir, ":", "-")
+		assert.FileExists(t, filepath.Join(tufCache, mirrorDir, "targets", "trusted_root.json"))
+	})
+
+	t.Run("DoInitializeStagingPQC fails closed without tufv1 fallback when trusted_root.json missing", func(t *testing.T) {
+		noTRRepo := t.TempDir()
+		if err := newTUFWithKeyGen(noTRRepo, map[string][]byte{"other.txt": []byte("hello")}, newMLDSAKey); err != nil {
+			t.Fatal(err)
+		}
+		noTRServer := httptest.NewServer(http.FileServer(http.Dir(noTRRepo)))
+		t.Cleanup(noTRServer.Close)
+		noTRRoot, err := os.ReadFile(filepath.Join(noTRRepo, "1.root.json"))
+		assert.NoError(t, err)
+
+		origMirror, origRoot := stagingPQCMirror, stagingPQCRoot
+		stagingPQCMirror = noTRServer.URL
+		stagingPQCRoot = func() []byte { return noTRRoot }
+		t.Cleanup(func() {
+			stagingPQCMirror = origMirror
+			stagingPQCRoot = origRoot
+		})
+
+		tufCache := t.TempDir()
+		t.Setenv("TUF_ROOT", tufCache)
+
+		_, _, gotErr := captureOutput(func() error {
+			return DoInitializeStagingPQC(context.Background())
+		})
+		assert.ErrorContains(t, gotErr, "fetching trusted_root.json from PQC staging TUF mirror")
+	})
+
+	t.Run("mismatched ML-DSA root is rejected", func(t *testing.T) {
+		otherRepo := t.TempDir()
+		if err := newTUFWithKeyGen(otherRepo, targets, newMLDSAKey); err != nil {
+			t.Fatal(err)
+		}
+		otherRootPath := filepath.Join(otherRepo, "1.root.json")
+
+		origMirror, origRoot := stagingPQCMirror, stagingPQCRoot
+		stagingPQCMirror = tufServer.URL
+		stagingPQCRoot = func() []byte { return rootBytes }
+		t.Cleanup(func() {
+			stagingPQCMirror = origMirror
+			stagingPQCRoot = origRoot
+		})
+
+		// Passing explicit wrong root with PQC staging mirror must NOT be silently
+		// overwritten by the embedded root; verification must fail closed and
+		// leave the prior TUF cache untouched.
+		tufCache := t.TempDir()
+		priorRemote := []byte(`{"mirror":"https://tuf-repo-cdn.sigstore.dev"}`)
+		assert.NoError(t, os.WriteFile(filepath.Join(tufCache, "remote.json"), priorRemote, 0o600))
+		t.Setenv("TUF_ROOT", tufCache)
+
+		_, _, gotErr := captureOutput(func() error {
+			return DoInitialize(context.Background(), otherRootPath, tufServer.URL+"/")
+		})
+		assert.ErrorContains(t, gotErr, "fetching trusted_root.json from PQC staging TUF mirror")
+		gotRemote, err := os.ReadFile(filepath.Join(tufCache, "remote.json"))
+		assert.NoError(t, err)
+		assert.Equal(t, priorRemote, gotRemote)
+	})
 }

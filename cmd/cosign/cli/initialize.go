@@ -18,6 +18,7 @@ package cli
 import (
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/initialize"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v3/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -48,6 +49,9 @@ cosign initialize
 # initialize root with distributed root keys, using the staging mirror.
 cosign initialize --staging
 
+# initialize root with distributed ML-DSA root keys, using the experimental PQC staging mirror.
+cosign initialize --experimental-pqc-staging
+
 # initialize with an out-of-band root key file, using the default mirror.
 cosign initialize --root <url>
 
@@ -60,6 +64,10 @@ cosign initialize --mirror <url> --root <url> --root-checksum <sha256>`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if o.Staging {
 				return initialize.DoInitializeStaging(cmd.Context())
+			}
+			if o.ExperimentalPQCStaging {
+				ui.Warnf(cmd.Context(), "Using experimental PQC staging TUF repository. This feature is experimental and subject to breaking changes without notice.")
+				return initialize.DoInitializeStagingPQC(cmd.Context())
 			}
 			return initialize.DoInitializeWithRootChecksum(cmd.Context(), o.Root, o.Mirror, o.RootChecksum)
 		},

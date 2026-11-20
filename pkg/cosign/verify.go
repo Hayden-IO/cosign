@@ -182,6 +182,13 @@ func (v *verifyTrustedMaterial) PublicKeyVerifier(hint string) (root.TimeConstra
 	return v.keyTrustedMaterial.PublicKeyVerifier(hint)
 }
 
+func (v *verifyTrustedMaterial) PublicKeyVerifiers() []root.TimeConstrainedVerifier {
+	if v.keyTrustedMaterial == nil {
+		return nil
+	}
+	return v.keyTrustedMaterial.PublicKeyVerifiers()
+}
+
 // verificationOptions returns the verification options for verifying with sigstore-go.
 func (co *CheckOpts) verificationOptions() (trustedMaterial root.TrustedMaterial, verifierOptions []verify.VerifierOption, policyOptions []verify.PolicyOption, err error) {
 	if co.TrustedMaterial == nil && co.SigVerifier == nil {

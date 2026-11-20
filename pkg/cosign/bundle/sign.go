@@ -160,7 +160,17 @@ type verifyTrustedMaterial struct {
 }
 
 func (v *verifyTrustedMaterial) PublicKeyVerifier(hint string) (root.TimeConstrainedVerifier, error) {
+	if v.keyTrustedMaterial == nil {
+		return nil, fmt.Errorf("no public key material available")
+	}
 	return v.keyTrustedMaterial.PublicKeyVerifier(hint)
+}
+
+func (v *verifyTrustedMaterial) PublicKeyVerifiers() []root.TimeConstrainedVerifier {
+	if v.keyTrustedMaterial == nil {
+		return nil
+	}
+	return v.keyTrustedMaterial.PublicKeyVerifiers()
 }
 
 type localCertProvider struct {
