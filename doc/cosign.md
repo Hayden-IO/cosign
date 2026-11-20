@@ -21,7 +21,7 @@ A tool for Container Signing, Verification and Storage in an OCI registry
 * [cosign download](cosign_download.md)	 - Provides utilities for downloading artifacts and attached artifacts in a registry
 * [cosign env](cosign_env.md)	 - Prints Cosign environment variables
 * [cosign generate-key-pair](cosign_generate-key-pair.md)	 - Generates a key-pair
-* [cosign import-key-pair](cosign_import-key-pair.md)	 - Imports a PEM-encoded RSA or EC private key
+* [cosign import-key-pair](cosign_import-key-pair.md)	 - Imports a PEM-encoded RSA, EC, Ed25519, or ML-DSA-44 private key
 * [cosign initialize](cosign_initialize.md)	 - Initializes SigStore root to retrieve trusted certificate and key targets for verification
 * [cosign load](cosign_load.md)	 - Load a signed image on disk to a remote registry
 * [cosign login](cosign_login.md)	 - Log in to a registry

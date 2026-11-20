@@ -21,6 +21,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -32,6 +33,7 @@ import (
 	"testing"
 
 	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
+	"github.com/sigstore/sigstore-go/pkg/sign"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
 )
@@ -80,6 +82,10 @@ func TestNewKMSKeypair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to generate ed25519 key: %v", err)
 	}
+	mldsaPriv, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		t.Fatalf("failed to generate mldsa key: %v", err)
+	}
 
 	testCases := []struct {
 		name      string
@@ -107,6 +113,29 @@ func TestNewKMSKeypair(t *testing.T) {
 				pubKey: ed25519Priv.Public(),
 			},
 			expectErr: false,
+		},
+		{
+			name: "ML-DSA-44 key",
+			sv: &mockSignerVerifier{
+				pubKey: mldsaPriv.Public(),
+			},
+			expectErr: false,
+		},
+		{
+			name: "Typed nil ML-DSA key",
+			sv: &mockSignerVerifier{
+				pubKey: (*mldsa.PublicKey)(nil),
+			},
+			expectErr: true,
+			errMsg:    "invalid ML-DSA public key",
+		},
+		{
+			name: "Uninitialized ML-DSA key",
+			sv: &mockSignerVerifier{
+				pubKey: &mldsa.PublicKey{},
+			},
+			expectErr: true,
+			errMsg:    "invalid ML-DSA public key",
 		},
 		{
 			name: "Unsupported key type",
@@ -353,6 +382,120 @@ func TestKMSKeypair_ED25519_Methods(t *testing.T) {
 		}
 		if len(digest) != 0 {
 			t.Errorf("expected empty digest, got %x", digest)
+		}
+	})
+}
+
+func TestSignerVerifierKeypair_MLDSA44_Methods(t *testing.T) {
+	sv, mldsaPriv, err := signature.NewDefaultMLDSASignerVerifier()
+	if err != nil {
+		t.Fatalf("failed to generate ML-DSA-44 signer verifier: %v", err)
+	}
+	kp, err := NewSignerVerifierKeypair(sv, nil)
+	if err != nil {
+		t.Fatalf("failed to create SignerVerifierKeypair: %v", err)
+	}
+
+	t.Run("GetHashAlgorithm", func(t *testing.T) {
+		if kp.GetHashAlgorithm() != protocommon.HashAlgorithm_HASH_ALGORITHM_UNSPECIFIED {
+			t.Errorf("expected HASH_ALGORITHM_UNSPECIFIED, got %v", kp.GetHashAlgorithm())
+		}
+	})
+
+	t.Run("GetSigningAlgorithm", func(t *testing.T) {
+		if kp.GetSigningAlgorithm() != protocommon.PublicKeyDetails_ML_DSA_44 {
+			t.Errorf("expected ML_DSA_44, got %v", kp.GetSigningAlgorithm())
+		}
+	})
+
+	t.Run("GetHint", func(t *testing.T) {
+		pubKeyBytes, err := x509.MarshalPKIXPublicKey(mldsaPriv.Public())
+		if err != nil {
+			t.Fatalf("marshalling public key: %v", err)
+		}
+		hashedBytes := sha256.Sum256(pubKeyBytes)
+		expectedHint := base64.StdEncoding.EncodeToString(hashedBytes[:])
+
+		if string(kp.GetHint()) != expectedHint {
+			t.Errorf("expected hint %s, got %s", expectedHint, string(kp.GetHint()))
+		}
+	})
+
+	t.Run("GetKeyAlgorithm", func(t *testing.T) {
+		if kp.GetKeyAlgorithm() != "ML-DSA-44" {
+			t.Errorf("expected ML-DSA-44, got %s", kp.GetKeyAlgorithm())
+		}
+	})
+
+	t.Run("GetPublicKey", func(t *testing.T) {
+		pub := kp.GetPublicKey()
+		mldsaPub, ok := pub.(*mldsa.PublicKey)
+		if !ok || !mldsaPub.Equal(mldsaPriv.Public()) {
+			t.Errorf("public keys do not match")
+		}
+	})
+
+	t.Run("GetPublicKeyPem", func(t *testing.T) {
+		pemStr, err := kp.GetPublicKeyPem()
+		if err != nil {
+			t.Fatalf("GetPublicKeyPem returned an error: %v", err)
+		}
+		pub, err := cryptoutils.UnmarshalPEMToPublicKey([]byte(pemStr))
+		if err != nil {
+			t.Fatalf("failed to unmarshal pem: %v", err)
+		}
+		if !pub.(*mldsa.PublicKey).Equal(mldsaPriv.Public()) {
+			t.Error("public keys do not match")
+		}
+	})
+
+	t.Run("SignData signs directly without prehashing", func(t *testing.T) {
+		data := []byte("c2sp.org/identity-transparency/v1\x00domain-separated-payload")
+		sig, digest, err := kp.SignData(context.Background(), data)
+		if err != nil {
+			t.Fatalf("SignData returned an error: %v", err)
+		}
+		if len(digest) != 0 {
+			t.Errorf("expected empty digest for ML-DSA, got %x", digest)
+		}
+		if err := mldsa.Verify(mldsaPriv.PublicKey(), data, sig, nil); err != nil {
+			t.Fatalf("mldsa.Verify failed on direct SignData output: %v", err)
+		}
+	})
+
+	t.Run("SignData does not pass crypto.SignerOpts for ML-DSA", func(t *testing.T) {
+		mockSV := &mockSignerVerifier{pubKey: mldsaPriv.Public()}
+		mockKP, err := NewSignerVerifierKeypair(mockSV, nil)
+		if err != nil {
+			t.Fatalf("NewSignerVerifierKeypair: %v", err)
+		}
+		_, digest, err := mockKP.SignData(context.Background(), []byte("payload"))
+		if err != nil {
+			t.Fatalf("SignData: %v", err)
+		}
+		if len(digest) != 0 {
+			t.Errorf("expected empty digest, got %x", digest)
+		}
+		if mockSV.signerOpts != nil {
+			t.Errorf("expected nil crypto.SignerOpts for ML-DSA, got %v", mockSV.signerOpts)
+		}
+	})
+
+	t.Run("compatible with sigstore-go PublicKeyCredential", func(t *testing.T) {
+		msgDigest := sha256.Sum256([]byte("artifact-bytes"))
+		cred := &sign.PublicKeyCredential{Keypair: kp}
+		req, err := cred.ToIdentityRequestV001(context.Background(), msgDigest[:])
+		if err != nil {
+			t.Fatalf("ToIdentityRequestV001: %v", err)
+		}
+		pkCred := req.GetPublicKey()
+		if pkCred == nil {
+			t.Fatal("expected PublicKey credential in IdentityRequestV001")
+		}
+		doubleHash := sha256.Sum256(msgDigest[:])
+		expectedPayload := append([]byte("c2sp.org/identity-transparency/v1\x00"), doubleHash[:]...)
+		if err := mldsa.Verify(mldsaPriv.PublicKey(), expectedPayload, pkCred.GetSignature(), nil); err != nil {
+			t.Fatalf("mldsa.Verify failed on PublicKeyCredential signature: %v", err)
 		}
 	})
 }

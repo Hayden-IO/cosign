@@ -16,6 +16,10 @@
 package options
 
 import (
+	"fmt"
+	"strings"
+
+	"github.com/sigstore/cosign/v3/pkg/cosign"
 	"github.com/spf13/cobra"
 )
 
@@ -24,6 +28,7 @@ type GenerateKeyPairOptions struct {
 	// KMS Key Management Service
 	KMS             string
 	OutputKeyPrefix string
+	Algorithm       string
 }
 
 var _ Interface = (*GenerateKeyPairOptions)(nil)
@@ -34,4 +39,8 @@ func (o *GenerateKeyPairOptions) AddFlags(cmd *cobra.Command) {
 		"create key pair in KMS service to use for signing")
 	cmd.Flags().StringVar(&o.OutputKeyPrefix, "output-key-prefix", "cosign",
 		"name used for generated .pub and .key files (defaults to `cosign`)")
+	cmd.Flags().StringVar(&o.Algorithm, "algorithm", "",
+		fmt.Sprintf("key algorithm to generate (defaults to ecdsa-sha2-256-nistp256). Supported algorithms: %s. "+
+			"Note: mldsa-44 is EXPERIMENTAL and only supported for transparent PQC signing; mldsa-65 and mldsa-87 will be supported in the future for non-transparent signatures",
+			strings.Join(cosign.GetSupportedKeyPairAlgorithms(), ", ")))
 }

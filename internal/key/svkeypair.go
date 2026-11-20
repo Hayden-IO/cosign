@@ -20,6 +20,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -49,6 +50,13 @@ func NewSignerVerifierKeypair(sv signature.SignerVerifier, defaultLoadOptions *[
 	if err != nil {
 		return nil, fmt.Errorf("getting public key: %w", err)
 	}
+	var mldsaParams mldsa.Parameters
+	if mldsaPub, ok := pubKey.(*mldsa.PublicKey); ok {
+		mldsaParams, err = cryptoutils.ValidateMLDSAPublicKey(mldsaPub)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ML-DSA public key: %w", err)
+		}
+	}
 	pubKeyBytes, err := x509.MarshalPKIXPublicKey(pubKey)
 	if err != nil {
 		return nil, fmt.Errorf("marshalling public key: %w", err)
@@ -64,6 +72,8 @@ func NewSignerVerifierKeypair(sv signature.SignerVerifier, defaultLoadOptions *[
 		keyAlg = "RSA"
 	case ed25519.PublicKey:
 		keyAlg = "ED25519"
+	case *mldsa.PublicKey:
+		keyAlg = mldsaParams.String()
 	default:
 		return nil, errors.New("unsupported key type")
 	}

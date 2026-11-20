@@ -17,16 +17,21 @@ package importkeypair
 
 import (
 	"context"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/options"
 	icos "github.com/sigstore/cosign/v3/internal/pkg/cosign"
+	"github.com/sigstore/cosign/v3/pkg/cosign"
 )
 
 func TestReadPasswordFn_env(t *testing.T) {
@@ -77,6 +82,93 @@ func TestImportOfKeys(t *testing.T) {
 	// cleanup
 	checkIfFileExistsThenDelete(outputtedKeyPairFileName+".key", t)
 	checkIfFileExistsThenDelete(outputtedKeyPairFileName+".pub", t)
+}
+
+func TestImportOfMLDSAKeys(t *testing.T) {
+	t.Setenv("COSIGN_PASSWORD", "mldsa-pass")
+	td := t.TempDir()
+
+	writePKCS8 := func(t *testing.T, name string, params mldsa.Parameters) (string, *mldsa.PrivateKey) {
+		t.Helper()
+		priv, err := mldsa.GenerateKey(params)
+		if err != nil {
+			t.Fatalf("mldsa.GenerateKey: %v", err)
+		}
+		der, err := x509.MarshalPKCS8PrivateKey(priv)
+		if err != nil {
+			t.Fatalf("MarshalPKCS8PrivateKey: %v", err)
+		}
+		keyPath := filepath.Join(td, name)
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: cosign.PrivateKeyPemType, Bytes: der})
+		if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		return keyPath, priv
+	}
+
+	t.Run("ML-DSA-44 imports via CLI", func(t *testing.T) {
+		inPath, priv := writePKCS8(t, "mldsa44.pem", mldsa.MLDSA44())
+		outPrefix := filepath.Join(td, "imported-mldsa44")
+		err := ImportKeyPairCmd(context.Background(), options.ImportKeyPairOptions{
+			Key:              inPath,
+			OutputKeyPrefix:  outPrefix,
+			SkipConfirmation: true,
+		}, nil)
+		if err != nil {
+			t.Fatalf("ImportKeyPairCmd: %v", err)
+		}
+
+		privPath := outPrefix + ".key"
+		if runtime.GOOS != "windows" {
+			info, err := os.Stat(privPath)
+			if err != nil {
+				t.Fatalf("stat private key: %v", err)
+			}
+			if perm := info.Mode().Perm(); perm != 0600 {
+				t.Fatalf("expected mode 0600, got %o", perm)
+			}
+		}
+
+		privBytes, err := os.ReadFile(privPath)
+		if err != nil {
+			t.Fatalf("reading imported private key: %v", err)
+		}
+		sv, err := cosign.LoadPrivateKey(privBytes, []byte("mldsa-pass"), nil)
+		if err != nil {
+			t.Fatalf("LoadPrivateKey: %v", err)
+		}
+		pub, err := sv.PublicKey()
+		if err != nil {
+			t.Fatalf("PublicKey: %v", err)
+		}
+		if !priv.PublicKey().Equal(pub) {
+			t.Fatal("imported public key does not match original ML-DSA-44 key")
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		params mldsa.Parameters
+	}{
+		{name: "ML-DSA-65", params: mldsa.MLDSA65()},
+		{name: "ML-DSA-87", params: mldsa.MLDSA87()},
+	} {
+		t.Run(tc.name+" rejected via CLI", func(t *testing.T) {
+			inPath, _ := writePKCS8(t, tc.name+".pem", tc.params)
+			outPrefix := filepath.Join(td, "imported-"+tc.name)
+			err := ImportKeyPairCmd(context.Background(), options.ImportKeyPairOptions{
+				Key:              inPath,
+				OutputKeyPrefix:  outPrefix,
+				SkipConfirmation: true,
+			}, nil)
+			if !errors.Is(err, cosign.ErrUnsupportedMLDSAParameters) {
+				t.Fatalf("expected ErrUnsupportedMLDSAParameters, got %v", err)
+			}
+			if _, statErr := os.Stat(outPrefix + ".key"); !os.IsNotExist(statErr) {
+				t.Fatalf("expected no output key file written on error")
+			}
+		})
+	}
 }
 
 func createTemporaryPrivateKeyForImporting(privateKeyName string) {

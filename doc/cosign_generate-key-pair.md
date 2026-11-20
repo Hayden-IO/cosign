@@ -13,10 +13,13 @@ cosign generate-key-pair [flags]
 ### Examples
 
 ```
-  cosign generate-key-pair [--kms KMSPATH]
+  cosign generate-key-pair [--kms KMSPATH | --algorithm ALGORITHM]
 
   # generate key-pair and write to cosign.key and cosign.pub files
   cosign generate-key-pair
+
+  # generate an experimental ML-DSA-44 key-pair for transparent PQC signing
+  cosign generate-key-pair --algorithm mldsa-44
 
   # generate key-pair and write to custom named my-name.key and my-name.pub files
   cosign generate-key-pair --output-key-prefix my-name
@@ -59,6 +62,7 @@ CAVEATS:
 ### Options
 
 ```
+      --algorithm string           key algorithm to generate (defaults to ecdsa-sha2-256-nistp256). Supported algorithms: ecdsa-sha2-256-nistp256, ecdsa-sha2-384-nistp384, ecdsa-sha2-512-nistp521, ed25519, mldsa-44, rsa-sign-pkcs1-2048-sha256, rsa-sign-pkcs1-3072-sha256, rsa-sign-pkcs1-4096-sha256. Note: mldsa-44 is EXPERIMENTAL and only supported for transparent PQC signing; mldsa-65 and mldsa-87 will be supported in the future for non-transparent signatures
   -h, --help[=true|false]          help for generate-key-pair
       --kms string                 create key pair in KMS service to use for signing
       --output-key-prefix cosign   name used for generated .pub and .key files (defaults to cosign) (default "cosign")

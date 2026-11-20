@@ -27,14 +27,14 @@ func ImportKeyPair() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "import-key-pair",
-		Short: "Imports a PEM-encoded RSA or EC private key",
-		Long:  "Imports a PEM-encoded RSA or EC private key for signing.",
+		Short: "Imports a PEM-encoded RSA, EC, Ed25519, or ML-DSA-44 private key",
+		Long:  "Imports a PEM-encoded RSA, EC, Ed25519, or ML-DSA-44 private key for signing.",
 		Example: `  cosign import-key-pair  --key openssl.key --output-key-prefix my-key
 
-  # import PEM-encoded RSA or EC private key and write to import-cosign.key and import-cosign.pub files
+  # import PEM-encoded private key and write to import-cosign.key and import-cosign.pub files
   cosign import-key-pair --key <key path>
 
-  # import PEM-encoded RSA or EC private key and write to my-key.key and my-key.pub files
+  # import PEM-encoded private key and write to my-key.key and my-key.pub files
   cosign import-key-pair --key <key path> --output-key-prefix my-key
 
 CAVEATS:

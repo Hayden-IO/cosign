@@ -16,8 +16,13 @@
 package cli
 
 import (
+	"errors"
+	"fmt"
+	"strings"
+
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/generate"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v3/pkg/cosign"
 	"github.com/spf13/cobra"
 )
 
@@ -28,10 +33,13 @@ func GenerateKeyPair() *cobra.Command {
 		Use:   "generate-key-pair",
 		Short: "Generates a key-pair",
 		Long:  "Generates a key-pair for signing.",
-		Example: `  cosign generate-key-pair [--kms KMSPATH]
+		Example: `  cosign generate-key-pair [--kms KMSPATH | --algorithm ALGORITHM]
 
   # generate key-pair and write to cosign.key and cosign.pub files
   cosign generate-key-pair
+
+  # generate an experimental ML-DSA-44 key-pair for transparent PQC signing
+  cosign generate-key-pair --algorithm mldsa-44
 
   # generate key-pair and write to custom named my-name.key and my-name.pub files
   cosign generate-key-pair --output-key-prefix my-name
@@ -71,8 +79,18 @@ CAVEATS:
   the COSIGN_PASSWORD environment variable to provide one.`,
 
 		PersistentPreRun: options.BindViper,
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			if (cmd.Flags().Changed("algorithm") || o.Algorithm != "") && (o.KMS != "" || len(args) > 0) {
+				return errors.New("--algorithm is not supported with --kms or remote key storage targets (k8s://, github://, gitlab://)")
+			}
+			if cmd.Flags().Changed("algorithm") && o.Algorithm == "" {
+				return fmt.Errorf("invalid algorithm %q; supported algorithms are: %s",
+					o.Algorithm, strings.Join(cosign.GetSupportedKeyPairAlgorithms(), ", "))
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return generate.GenerateKeyPairCmd(cmd.Context(), o.KMS, o.OutputKeyPrefix, args)
+			return generate.KeyPairWithAlgorithmCmd(cmd.Context(), o.KMS, o.OutputKeyPrefix, o.Algorithm, args)
 		},
 	}
 

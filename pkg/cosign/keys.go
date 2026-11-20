@@ -19,6 +19,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/rsa"
 	_ "crypto/sha256" // for `crypto.SHA256`
@@ -46,11 +47,14 @@ const (
 	RSAPrivateKeyPemType = "RSA PRIVATE KEY"
 	// PEM-encoded ECDSA private key
 	ECPrivateKeyPemType = "EC PRIVATE KEY"
-	// PEM-encoded PKCS #8 RSA, ECDSA or ED25519 private key
+	// PEM-encoded PKCS #8 RSA, ECDSA, ED25519, or ML-DSA private key
 	PrivateKeyPemType   = "PRIVATE KEY"
 	BundleKey           = static.BundleAnnotationKey
 	RFC3161TimestampKey = static.RFC3161TimestampAnnotationKey
 )
+
+// ErrUnsupportedMLDSAParameters is returned when ML-DSA-65 or ML-DSA-87 is requested.
+var ErrUnsupportedMLDSAParameters = errors.New("only mldsa-44 is currently supported for transparent signing; mldsa-65 and mldsa-87 will be supported in the future for non-transparent signatures")
 
 var SupportedKeyDetails = []v1.PublicKeyDetails{
 	v1.PublicKeyDetails_PKIX_ECDSA_P256_SHA_256,
@@ -61,6 +65,19 @@ var SupportedKeyDetails = []v1.PublicKeyDetails{
 	v1.PublicKeyDetails_PKIX_RSA_PKCS1V15_4096_SHA256,
 	// Ed25519ph is not supported by Fulcio, so we don't support it here for now.
 	// v1.PublicKeyDetails_PKIX_ED25519_PH,
+}
+
+// SupportedKeyPairAlgorithms lists the algorithms supported by cosign generate-key-pair.
+// SupportedKeyDetails remains strictly classical for v1 ephemeral signing.
+var SupportedKeyPairAlgorithms = []v1.PublicKeyDetails{
+	v1.PublicKeyDetails_PKIX_ECDSA_P256_SHA_256,
+	v1.PublicKeyDetails_PKIX_ECDSA_P384_SHA_384,
+	v1.PublicKeyDetails_PKIX_ECDSA_P521_SHA_512,
+	v1.PublicKeyDetails_PKIX_RSA_PKCS1V15_2048_SHA256,
+	v1.PublicKeyDetails_PKIX_RSA_PKCS1V15_3072_SHA256,
+	v1.PublicKeyDetails_PKIX_RSA_PKCS1V15_4096_SHA256,
+	v1.PublicKeyDetails_PKIX_ED25519,
+	v1.PublicKeyDetails_ML_DSA_44,
 }
 
 // PassFunc is the function to be called to retrieve the signer password. If
@@ -123,6 +140,15 @@ func GeneratePrivateKeyWithAlgorithm(algo *signature.AlgorithmDetails) (crypto.P
 			return nil, fmt.Errorf("error generating ED25519 key: %w", err)
 		}
 		return priv, nil
+	case signature.MLDSA:
+		params, err := currentAlgo.GetMLDSAParameters()
+		if err != nil {
+			return nil, fmt.Errorf("error getting ML-DSA parameters: %w", err)
+		}
+		if params != mldsa.MLDSA44() {
+			return nil, fmt.Errorf("unsupported ML-DSA parameters %s: %w", params, ErrUnsupportedMLDSAParameters)
+		}
+		return mldsa.GenerateKey(params)
 	default:
 		return nil, fmt.Errorf("unsupported key type: %v", currentAlgo.GetKeyType())
 	}
@@ -133,7 +159,7 @@ func GeneratePrivateKeyWithAlgorithm(algo *signature.AlgorithmDetails) (crypto.P
 // The private key can be in one of the following formats:
 // - RSA private key (PKCS #1)
 // - ECDSA private key
-// - PKCS #8 private key (RSA, ECDSA or ED25519).
+// - PKCS #8 private key (RSA, ECDSA, ED25519, or ML-DSA-44).
 func ImportKeyPair(keyPath string, pf PassFunc) (*KeysBytes, error) {
 	kb, err := os.ReadFile(filepath.Clean(keyPath))
 	if err != nil {
@@ -169,7 +195,7 @@ func ImportKeyPair(keyPath string, pf PassFunc) (*KeysBytes, error) {
 	case PrivateKeyPemType:
 		pkcs8Pk, err := x509.ParsePKCS8PrivateKey(p.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing pkcs #8 private key")
+			return nil, fmt.Errorf("error parsing pkcs #8 private key: %w", err)
 		}
 		switch k := pkcs8Pk.(type) {
 		case *rsa.PrivateKey:
@@ -185,6 +211,18 @@ func ImportKeyPair(keyPath string, pf PassFunc) (*KeysBytes, error) {
 		case ed25519.PrivateKey:
 			if err = goodkey.ValidatePubKey(k.Public()); err != nil {
 				return nil, fmt.Errorf("error validating ed25519 key: %w", err)
+			}
+			pk = k
+		case *mldsa.PrivateKey:
+			if k == nil {
+				return nil, errors.New("error validating mldsa key: nil private key")
+			}
+			params, err := cryptoutils.ValidateMLDSAPublicKey(k.PublicKey())
+			if err != nil {
+				return nil, fmt.Errorf("error validating mldsa key: %w", err)
+			}
+			if params != mldsa.MLDSA44() {
+				return nil, fmt.Errorf("unsupported ML-DSA parameters %s: %w", params, ErrUnsupportedMLDSAParameters)
 			}
 			pk = k
 		default:
@@ -313,8 +351,18 @@ func GetDefaultLoadOptions(defaultLoadOptions *[]signature.LoadOption) *[]signat
 
 // GetSupportedAlgorithms returns a list of supported algorithms sorted alphabetically.
 func GetSupportedAlgorithms() []string {
-	algorithms := make([]string, 0, len(SupportedKeyDetails))
-	for _, algorithm := range SupportedKeyDetails {
+	return formatSupportedAlgorithms(SupportedKeyDetails)
+}
+
+// GetSupportedKeyPairAlgorithms returns a sorted list of algorithm flags
+// supported by cosign generate-key-pair.
+func GetSupportedKeyPairAlgorithms() []string {
+	return formatSupportedAlgorithms(SupportedKeyPairAlgorithms)
+}
+
+func formatSupportedAlgorithms(details []v1.PublicKeyDetails) []string {
+	algorithms := make([]string, 0, len(details))
+	for _, algorithm := range details {
 		signatureFlag, err := signature.FormatSignatureAlgorithmFlag(algorithm)
 		if err != nil {
 			continue

@@ -1,10 +1,10 @@
 ## cosign import-key-pair
 
-Imports a PEM-encoded RSA or EC private key
+Imports a PEM-encoded RSA, EC, Ed25519, or ML-DSA-44 private key
 
 ### Synopsis
 
-Imports a PEM-encoded RSA or EC private key for signing.
+Imports a PEM-encoded RSA, EC, Ed25519, or ML-DSA-44 private key for signing.
 
 ```
 cosign import-key-pair [flags]
@@ -15,10 +15,10 @@ cosign import-key-pair [flags]
 ```
   cosign import-key-pair  --key openssl.key --output-key-prefix my-key
 
-  # import PEM-encoded RSA or EC private key and write to import-cosign.key and import-cosign.pub files
+  # import PEM-encoded private key and write to import-cosign.key and import-cosign.pub files
   cosign import-key-pair --key <key path>
 
-  # import PEM-encoded RSA or EC private key and write to my-key.key and my-key.pub files
+  # import PEM-encoded private key and write to my-key.key and my-key.pub files
   cosign import-key-pair --key <key path> --output-key-prefix my-key
 
 CAVEATS:

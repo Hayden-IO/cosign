@@ -17,6 +17,7 @@ package importkeypair
 
 import (
 	"context"
+	"crypto/mldsa"
 	"fmt"
 	"io"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"github.com/sigstore/cosign/v3/internal/ui"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
 	"github.com/sigstore/cosign/v3/pkg/cosign/env"
+	"github.com/sigstore/sigstore/pkg/cryptoutils"
 )
 
 var (
@@ -38,6 +40,11 @@ func ImportKeyPairCmd(ctx context.Context, o options.ImportKeyPairOptions, args 
 	keys, err := cosign.ImportKeyPair(o.Key, GetPass)
 	if err != nil {
 		return err
+	}
+	if pub, pubErr := cryptoutils.UnmarshalPEMToPublicKey(keys.PublicBytes); pubErr == nil {
+		if _, ok := pub.(*mldsa.PublicKey); ok {
+			ui.Warnf(ctx, "Imported an EXPERIMENTAL ML-DSA-44 key pair. PQC support in Cosign is experimental and subject to breaking changes.")
+		}
 	}
 
 	privateKeyFileName := o.OutputKeyPrefix + ".key"

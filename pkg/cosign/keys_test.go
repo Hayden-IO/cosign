@@ -16,12 +16,19 @@
 package cosign
 
 import (
+	"bytes"
+	"crypto/mldsa"
 	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
+	v1 "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
+	"github.com/sigstore/sigstore/pkg/cryptoutils"
+	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/stretchr/testify/require"
 )
 
@@ -504,4 +511,116 @@ func TestImportPrivateKey(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGenerateAndLoadMLDSA44KeyPair(t *testing.T) {
+	algo, err := signature.GetAlgorithmDetails(v1.PublicKeyDetails_ML_DSA_44)
+	require.NoError(t, err)
+
+	keys, err := GenerateKeyPairWithAlgorithm(&algo, pass("pqc-pass"))
+	require.NoError(t, err)
+	require.Contains(t, string(keys.PrivateBytes), SigstorePrivateKeyPemType)
+
+	// Wrong password fails
+	_, err = LoadPrivateKey(keys.PrivateBytes, []byte("wrong"), nil)
+	require.Error(t, err)
+
+	// Correct password decrypts and produces a working ML-DSA-44 SignerVerifier
+	sv, err := LoadPrivateKey(keys.PrivateBytes, []byte("pqc-pass"), nil)
+	require.NoError(t, err)
+
+	pub, err := sv.PublicKey()
+	require.NoError(t, err)
+	mldsaPub, ok := pub.(*mldsa.PublicKey)
+	require.True(t, ok, "expected *mldsa.PublicKey, got %T", pub)
+	require.Equal(t, mldsa.MLDSA44(), mldsaPub.Parameters())
+
+	// Public PEM matches private key
+	parsedPub, err := cryptoutils.UnmarshalPEMToPublicKey(keys.PublicBytes)
+	require.NoError(t, err)
+	require.True(t, mldsaPub.Equal(parsedPub))
+
+	// Sign and verify message directly
+	msg := []byte("c2sp.org/identity-transparency/v1\x00test-payload")
+	sig, err := sv.SignMessage(bytes.NewReader(msg))
+	require.NoError(t, err)
+	require.NoError(t, sv.VerifySignature(bytes.NewReader(sig), bytes.NewReader(msg)))
+}
+
+func TestGeneratePrivateKeyWithAlgorithm_RejectsMLDSA65And87(t *testing.T) {
+	for _, alg := range []v1.PublicKeyDetails{
+		v1.PublicKeyDetails_ML_DSA_65,
+		v1.PublicKeyDetails_ML_DSA_87,
+	} {
+		t.Run(alg.String(), func(t *testing.T) {
+			details, err := signature.GetAlgorithmDetails(alg)
+			require.NoError(t, err)
+			_, err = GeneratePrivateKeyWithAlgorithm(&details)
+			require.ErrorIs(t, err, ErrUnsupportedMLDSAParameters)
+		})
+	}
+}
+
+func TestImportPrivateKey_MLDSA(t *testing.T) {
+	td := t.TempDir()
+
+	writePKCS8 := func(t *testing.T, name string, priv any) string {
+		t.Helper()
+		der, err := x509.MarshalPKCS8PrivateKey(priv)
+		require.NoError(t, err)
+		pemBytes := pem.EncodeToMemory(&pem.Block{Type: PrivateKeyPemType, Bytes: der})
+		p := filepath.Join(td, name)
+		require.NoError(t, os.WriteFile(p, pemBytes, 0600))
+		return p
+	}
+
+	t.Run("ML-DSA-44 imports and loads", func(t *testing.T) {
+		priv, err := mldsa.GenerateKey(mldsa.MLDSA44())
+		require.NoError(t, err)
+		p := writePKCS8(t, "mldsa44.pem", priv)
+
+		kb, err := ImportKeyPair(p, pass("import-pass"))
+		require.NoError(t, err)
+
+		sv, err := LoadPrivateKey(kb.PrivateBytes, []byte("import-pass"), nil)
+		require.NoError(t, err)
+		pub, err := sv.PublicKey()
+		require.NoError(t, err)
+		require.True(t, priv.PublicKey().Equal(pub))
+
+		msg := []byte("imported mldsa-44 test message")
+		sig, err := sv.SignMessage(bytes.NewReader(msg))
+		require.NoError(t, err)
+		require.NoError(t, mldsa.Verify(priv.PublicKey(), msg, sig, nil))
+	})
+
+	for _, tc := range []struct {
+		name   string
+		params mldsa.Parameters
+	}{
+		{name: "ML-DSA-65", params: mldsa.MLDSA65()},
+		{name: "ML-DSA-87", params: mldsa.MLDSA87()},
+	} {
+		t.Run(tc.name+" rejected with future-support message", func(t *testing.T) {
+			priv, err := mldsa.GenerateKey(tc.params)
+			require.NoError(t, err)
+			p := writePKCS8(t, tc.name+".pem", priv)
+
+			_, err = ImportKeyPair(p, pass("import-pass"))
+			require.ErrorIs(t, err, ErrUnsupportedMLDSAParameters)
+		})
+	}
+}
+
+func TestGetSupportedAlgorithmsVsKeyPairAlgorithms(t *testing.T) {
+	v1Algs := GetSupportedAlgorithms()
+	require.NotContains(t, v1Algs, "mldsa-44")
+	require.NotContains(t, v1Algs, "mldsa-65")
+	require.NotContains(t, v1Algs, "mldsa-87")
+
+	keyPairAlgs := GetSupportedKeyPairAlgorithms()
+	require.Contains(t, keyPairAlgs, "mldsa-44")
+	require.Contains(t, keyPairAlgs, "ecdsa-sha2-256-nistp256")
+	require.NotContains(t, keyPairAlgs, "mldsa-65")
+	require.NotContains(t, keyPairAlgs, "mldsa-87")
 }

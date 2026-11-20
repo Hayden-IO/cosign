@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/sigstore/cosign/v3/pkg/cosign/env"
@@ -33,7 +34,9 @@ import (
 	"github.com/sigstore/cosign/v3/internal/ui"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
 	"github.com/sigstore/cosign/v3/pkg/cosign/kubernetes"
+	v1 "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
+	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/kms"
 )
 
@@ -44,6 +47,16 @@ var (
 
 // nolint
 func GenerateKeyPairCmd(ctx context.Context, kmsVal string, outputKeyPrefixVal string, args []string) error {
+	return KeyPairWithAlgorithmCmd(ctx, kmsVal, outputKeyPrefixVal, "", args)
+}
+
+// KeyPairWithAlgorithmCmd generates a key pair with the optional algorithm flag.
+// When algorithm is empty, the default ECDSA P-256 algorithm is used.
+func KeyPairWithAlgorithmCmd(ctx context.Context, kmsVal string, outputKeyPrefixVal string, algorithm string, args []string) error {
+	if algorithm != "" && (kmsVal != "" || len(args) > 0) {
+		return errors.New("--algorithm is not supported with --kms or remote key storage targets (k8s://, github://, gitlab://)")
+	}
+
 	privateKeyFileName := outputKeyPrefixVal + ".key"
 	publicKeyFileName := outputKeyPrefixVal + ".pub"
 
@@ -86,7 +99,15 @@ func GenerateKeyPairCmd(ctx context.Context, kmsVal string, outputKeyPrefixVal s
 		return fmt.Errorf("undefined provider: %s", provider)
 	}
 
-	keys, err := cosign.GenerateKeyPair(GetPass)
+	algo, err := parseKeyPairAlgorithm(algorithm)
+	if err != nil {
+		return err
+	}
+	if algo != nil && algo.GetKeyType() == signature.MLDSA {
+		ui.Warnf(ctx, "Generating an EXPERIMENTAL ML-DSA-44 key pair. PQC support in Cosign is experimental and subject to breaking changes.")
+	}
+
+	keys, err := cosign.GenerateKeyPairWithAlgorithm(algo, GetPass)
 	if err != nil {
 		return err
 	}
@@ -105,6 +126,29 @@ func GenerateKeyPairCmd(ctx context.Context, kmsVal string, outputKeyPrefixVal s
 	}
 
 	return writeKeyFiles(privateKeyFileName, publicKeyFileName, keys)
+}
+
+func parseKeyPairAlgorithm(algorithm string) (*signature.AlgorithmDetails, error) {
+	if algorithm == "" {
+		return nil, nil
+	}
+	parsed, err := signature.ParseSignatureAlgorithmFlag(algorithm)
+	if err != nil {
+		return nil, fmt.Errorf("invalid algorithm %q; supported algorithms are: %s",
+			algorithm, strings.Join(cosign.GetSupportedKeyPairAlgorithms(), ", "))
+	}
+	if parsed == v1.PublicKeyDetails_ML_DSA_65 || parsed == v1.PublicKeyDetails_ML_DSA_87 {
+		return nil, fmt.Errorf("algorithm %q is not currently supported: %w", algorithm, cosign.ErrUnsupportedMLDSAParameters)
+	}
+	if !slices.Contains(cosign.SupportedKeyPairAlgorithms, parsed) {
+		return nil, fmt.Errorf("invalid algorithm %q; supported algorithms are: %s",
+			algorithm, strings.Join(cosign.GetSupportedKeyPairAlgorithms(), ", "))
+	}
+	details, err := signature.GetAlgorithmDetails(parsed)
+	if err != nil {
+		return nil, fmt.Errorf("getting algorithm details for %q: %w", algorithm, err)
+	}
+	return &details, nil
 }
 
 func writeKeyFiles(privateKeyFileName string, publicKeyFileName string, keys *cosign.KeysBytes) error {
