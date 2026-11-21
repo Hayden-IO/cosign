@@ -39,6 +39,7 @@ cosign attest-blob [flags]
       --bundle string                                 write everything required to verify the blob to a FILE
       --certificate string                            path to the X.509 certificate for signing attestation
       --certificate-chain string                      path to a list of CA X.509 certificates in PEM format which will be needed when building the certificate chain for the signed attestation. Must start with the parent intermediate CA certificate of the signing certificate and end with the root certificate.
+      --experimental-pqc[=true|false]                 EXPERIMENTAL: sign using post-quantum cryptography (ML-DSA / Rekor v3) and produce a Bundle v2. WARNING: PQC signing and Bundle v2 are experimental and subject to breaking changes; do not use for production workloads
       --fulcio-auth-flow string                       fulcio interactive oauth2 flow to use for certificate from fulcio. Defaults to determining the flow based on the runtime environment. (options) normal|device|token|client_credentials
       --hash string                                   hash of blob in hexadecimal (base16). Used if you want to sign an artifact stored elsewhere and have the hash
   -h, --help[=true|false]                             help for attest-blob

@@ -36,6 +36,7 @@ type SignOptions struct {
 	NoSigningConfig   bool
 	SigningConfigPath string
 	TrustedRootPath   string
+	ExperimentalPQC   bool
 
 	Fulcio      FulcioOptions
 	OIDC        OIDCOptions
@@ -113,4 +114,7 @@ func (o *SignOptions) AddFlags(cmd *cobra.Command) {
 
 	cmd.Flags().StringVar(&o.TrustedRootPath, "trusted-root", "",
 		"optional path to a TrustedRoot JSON file to verify a signature after signing")
+
+	cmd.Flags().BoolVar(&o.ExperimentalPQC, "experimental-pqc", false, ExperimentalPQCFlagUsage)
+	cmd.MarkFlagsMutuallyExclusive("experimental-pqc", "no-signing-config")
 }

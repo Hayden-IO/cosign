@@ -58,9 +58,12 @@ func SignBlob() *cobra.Command {
   cosign sign-blob --key hashivault://[KEY] --bundle <bundle.json> <FILE>`,
 		Args:             cobra.ExactArgs(1),
 		PersistentPreRun: options.BindViper,
-		PreRunE: func(_ *cobra.Command, _ []string) error {
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			if options.NOf(o.Key, o.SecurityKey.Use) > 1 {
 				return &options.KeyParseError{}
+			}
+			if o.ExperimentalPQC && cmd.Flags().Changed("signing-algorithm") {
+				return fmt.Errorf("--signing-algorithm is not supported with --experimental-pqc")
 			}
 
 			// Check if the algorithm is in the list of supported algorithms
@@ -98,7 +101,16 @@ func SignBlob() *cobra.Command {
 				TSAClientKey:                   o.TSAClientKey,
 				TSAServerName:                  o.TSAServerName,
 				IssueCertificateForExistingKey: o.IssueCertificate,
-				SigningAlgorithm:               o.SigningAlgorithm,
+				ExperimentalPQC:                o.ExperimentalPQC,
+			}
+			if !o.ExperimentalPQC {
+				ko.SigningAlgorithm = o.SigningAlgorithm
+			}
+			if o.ExperimentalPQC && o.NoSigningConfig {
+				return fmt.Errorf("--experimental-pqc cannot be used with --no-signing-config")
+			}
+			if err := signcommon.ValidatePQCFlags(ko, o.Cert, o.CertChain); err != nil {
+				return err
 			}
 			if err := signcommon.LoadSigningConfigAndTrustedMaterial(cmd.Context(), &ko, o.NoSigningConfig, o.SigningConfigPath, o.TrustedRootPath); err != nil {
 				return err

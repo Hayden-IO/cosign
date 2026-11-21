@@ -20,6 +20,7 @@ import (
 	_ "crypto/sha256" // for `crypto.SHA256`
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -49,6 +50,15 @@ func (c *AttestCommand) Exec(ctx context.Context, imageRef string) error {
 	// We can't have both a key and a security key
 	if options.NOf(c.KeyRef, c.Sk) > 1 {
 		return &options.KeyParseError{}
+	}
+	if c.SigningConfig == nil {
+		c.SigningConfig = signcommon.NewEmptySigningConfig()
+	}
+	if c.ExperimentalPQC {
+		signcommon.WarnExperimentalPQC(ctx)
+		if err := signcommon.ValidatePQCSigningOpts(c.KeyOpts, c.CertPath, c.CertChainPath); err != nil {
+			return err
+		}
 	}
 
 	if c.PredicatePath == "" {
@@ -117,13 +127,13 @@ func (c *AttestCommand) Exec(ctx context.Context, imageRef string) error {
 		OCIRemoteOpts: ociremoteOpts,
 	}
 
-	if c.SigningConfig == nil {
-		c.SigningConfig = signcommon.NewEmptySigningConfig()
-	}
 	if err := signcommon.RequireFulcioForCertificate(c.KeyOpts); err != nil {
 		return err
 	}
 	if !signcommon.ShouldUploadToTlog(ctx, c.KeyOpts, digest, len(c.SigningConfig.RekorLogURLs()) > 0) {
+		if c.ExperimentalPQC {
+			return fmt.Errorf("--experimental-pqc requires uploading to a Rekor v3 transparency log")
+		}
 		c.SigningConfig = c.SigningConfig.WithRekorLogURLs()
 	}
 	if err := signcommon.ConfirmPrivacyStatement(ctx, c.KeyOpts); err != nil {
@@ -136,7 +146,7 @@ func (c *AttestCommand) Exec(ctx context.Context, imageRef string) error {
 	}
 
 	if c.BundlePath != "" {
-		if err := os.WriteFile(c.BundlePath, bundleBytes, 0600); err != nil {
+		if err := os.WriteFile(filepath.Clean(c.BundlePath), bundleBytes, 0600); err != nil {
 			return fmt.Errorf("create bundle file: %w", err)
 		}
 		ui.Infof(ctx, "Wrote bundle to file %s", c.BundlePath)

@@ -57,6 +57,18 @@ func (c *AttestBlobCommand) Exec(ctx context.Context, artifactPath string) error
 	if options.NOf(c.KeyRef, c.Sk) > 1 {
 		return &options.KeyParseError{}
 	}
+	if c.SigningConfig == nil {
+		c.SigningConfig = signcommon.NewEmptySigningConfig()
+	}
+	if c.ExperimentalPQC {
+		signcommon.WarnExperimentalPQC(ctx)
+		if c.BundlePath == "" {
+			return fmt.Errorf("--bundle must be provided with --experimental-pqc")
+		}
+		if err := signcommon.ValidatePQCSigningOpts(c.KeyOpts, c.CertPath, c.CertChainPath); err != nil {
+			return err
+		}
+	}
 
 	if options.NOf(c.PredicatePath, c.StatementPath) != 1 {
 		return fmt.Errorf("one of --predicate or --statement must be set")
@@ -132,9 +144,6 @@ func (c *AttestBlobCommand) Exec(ctx context.Context, artifactPath string) error
 		BundlePath: c.BundlePath,
 	}
 
-	if c.SigningConfig == nil {
-		c.SigningConfig = signcommon.NewEmptySigningConfig()
-	}
 	if err := signcommon.RequireFulcioForCertificate(c.KeyOpts); err != nil {
 		return err
 	}
@@ -147,7 +156,7 @@ func (c *AttestBlobCommand) Exec(ctx context.Context, artifactPath string) error
 		return fmt.Errorf("creating bundle: %w", err)
 	}
 
-	if err := os.WriteFile(c.BundlePath, bundleBytes, 0600); err != nil {
+	if err := os.WriteFile(filepath.Clean(c.BundlePath), bundleBytes, 0600); err != nil {
 		return fmt.Errorf("create bundle file: %w", err)
 	}
 	ui.Infof(ctx, "Wrote bundle to file %s", c.BundlePath)

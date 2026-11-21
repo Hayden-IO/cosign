@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -45,8 +46,21 @@ func SignCmd(ctx context.Context, ro *options.RootOptions, ko options.KeyOpts, s
 		return &options.KeyParseError{}
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, ro.Timeout)
-	defer cancel()
+	if ko.ExperimentalPQC {
+		if ko.SigningConfig == nil {
+			ko.SigningConfig = signcommon.NewEmptySigningConfig()
+		}
+		signcommon.WarnExperimentalPQC(ctx)
+		if err := signcommon.ValidatePQCSigningOpts(ko, signOpts.Cert, signOpts.CertChain); err != nil {
+			return err
+		}
+	}
+
+	if ro != nil && ro.Timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, ro.Timeout)
+		defer cancel()
+	}
 
 	// Set up an ErrDone consideration to return along "success" paths
 	var ErrDone error
@@ -141,10 +155,16 @@ func signDigestBundle(ctx context.Context, digest name.Digest, ko options.KeyOpt
 	if ko.SigningConfig == nil {
 		ko.SigningConfig = signcommon.NewEmptySigningConfig()
 	}
+	if err := signcommon.ValidatePQCSigningOpts(ko, signOpts.Cert, signOpts.CertChain); err != nil {
+		return err
+	}
 	if err := signcommon.RequireFulcioForCertificate(ko); err != nil {
 		return err
 	}
 	if !signcommon.ShouldUploadToTlog(ctx, ko, digest, len(ko.SigningConfig.RekorLogURLs()) > 0) {
+		if ko.ExperimentalPQC {
+			return fmt.Errorf("--experimental-pqc requires uploading to a Rekor v3 transparency log")
+		}
 		ko.SigningConfig = ko.SigningConfig.WithRekorLogURLs()
 	}
 	if err := signcommon.ConfirmPrivacyStatement(ctx, ko); err != nil {
@@ -157,7 +177,7 @@ func signDigestBundle(ctx context.Context, digest name.Digest, ko options.KeyOpt
 	}
 
 	if signOpts.BundlePath != "" {
-		if err := os.WriteFile(signOpts.BundlePath, bundleBytes, 0600); err != nil {
+		if err := os.WriteFile(filepath.Clean(signOpts.BundlePath), bundleBytes, 0600); err != nil {
 			return fmt.Errorf("create bundle file: %w", err)
 		}
 		ui.Infof(ctx, "Wrote bundle to file %s", signOpts.BundlePath)

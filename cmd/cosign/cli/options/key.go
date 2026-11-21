@@ -21,6 +21,10 @@ import (
 	"github.com/sigstore/sigstore/pkg/signature"
 )
 
+// ExperimentalPQCFlagUsage is the shared CLI help text for --experimental-pqc.
+const ExperimentalPQCFlagUsage = "EXPERIMENTAL: sign using post-quantum cryptography (ML-DSA / Rekor v3) and produce a Bundle v2. " +
+	"WARNING: PQC signing and Bundle v2 are experimental and subject to breaking changes; do not use for production workloads"
+
 type KeyOpts struct {
 	Sk                   bool
 	Slot                 string
@@ -66,4 +70,8 @@ type KeyOpts struct {
 	// SigningAlgorithm is the AlgorithmDetails string representation used to
 	// sign/hash the payload.
 	SigningAlgorithm string
+
+	// ExperimentalPQC opts into experimental post-quantum transparent signing
+	// (Rekor v3 / ML-DSA) producing a Bundle v2.
+	ExperimentalPQC bool
 }

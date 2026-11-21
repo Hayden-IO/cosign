@@ -17,8 +17,14 @@ package signcommon
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/mldsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,10 +39,22 @@ import (
 	"github.com/sigstore/cosign/v3/internal/test"
 	"github.com/sigstore/cosign/v3/internal/ui"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
+	bundleV2 "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v2"
+	v1 "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	prototrustroot "github.com/sigstore/protobuf-specs/gen/pb-go/trustroot/v1"
+	pbrekor "github.com/sigstore/rekor-tiles/v2/pkg/generated/protobuf"
+	"github.com/sigstore/rekor-tiles/v2/pkg/note"
 	"github.com/sigstore/sigstore-go/pkg/root"
+	"github.com/sigstore/sigstore-go/pkg/sign"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
+	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/stretchr/testify/assert"
+	formatsLog "github.com/transparency-dev/formats/log"
+	"github.com/transparency-dev/formats/proof"
+	"github.com/transparency-dev/merkle/rfc6962"
+	sumdbNote "golang.org/x/mod/sumdb/note"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func pass(s string) cosign.PassFunc {
@@ -628,6 +646,10 @@ func TestRequireFulcioForCertificate(t *testing.T) {
 			ko:            options.KeyOpts{Sk: true, IssueCertificateForExistingKey: true},
 			wantErrSubstr: "certificate-based signing requires a signing config with a Fulcio certificate authority",
 		},
+		{
+			name: "experimental PQC keyless without Fulcio succeeds",
+			ko:   options.KeyOpts{ExperimentalPQC: true, SigningConfig: withoutFulcio},
+		},
 	}
 
 	for _, tt := range tests {
@@ -638,6 +660,283 @@ func TestRequireFulcioForCertificate(t *testing.T) {
 				return
 			}
 			assert.ErrorContains(t, err, tt.wantErrSubstr)
+		})
+	}
+}
+
+func makeRekorSigningConfig(t *testing.T, url string, majorVersion uint32) *root.SigningConfig {
+	t.Helper()
+	sc, err := root.NewSigningConfig(
+		root.SigningConfigMediaType02, nil, nil,
+		[]root.Service{{URL: url, MajorAPIVersion: majorVersion, ValidityPeriodStart: time.Now().Add(-time.Hour)}},
+		root.ServiceConfiguration{}, nil, root.ServiceConfiguration{},
+	)
+	if err != nil {
+		t.Fatalf("NewSigningConfig: %v", err)
+	}
+	return sc
+}
+
+func TestValidatePQCSigningOpts(t *testing.T) {
+	v3SC := makeRekorSigningConfig(t, "http://127.0.0.1:1234", 3)
+	v2SC := makeRekorSigningConfig(t, "http://127.0.0.1:1234", 2)
+	expiredV3SC, err := root.NewSigningConfig(
+		root.SigningConfigMediaType02, nil, nil,
+		[]root.Service{{URL: "http://127.0.0.1:1234", MajorAPIVersion: 3, ValidityPeriodStart: time.Now().Add(-2 * time.Hour), ValidityPeriodEnd: time.Now().Add(-time.Hour)}},
+		root.ServiceConfiguration{}, nil, root.ServiceConfiguration{},
+	)
+	assert.NoError(t, err)
+	mixedSC, err := root.NewSigningConfig(
+		root.SigningConfigMediaType02, nil, nil,
+		[]root.Service{
+			{URL: "http://127.0.0.1:1234", MajorAPIVersion: 2, ValidityPeriodStart: time.Now().Add(-time.Hour)},
+			{URL: "http://127.0.0.1:1235", MajorAPIVersion: 3, ValidityPeriodStart: time.Now().Add(-time.Hour)},
+		},
+		root.ServiceConfiguration{}, nil, root.ServiceConfiguration{},
+	)
+	assert.NoError(t, err)
+
+	tests := []struct {
+		name      string
+		ko        options.KeyOpts
+		cert      string
+		certChain string
+		wantErr   string
+	}{
+		{"disabled skips checks", options.KeyOpts{Sk: true}, "c.pem", "chain.pem", ""},
+		{"valid with Rekor v3", options.KeyOpts{ExperimentalPQC: true, SigningConfig: v3SC}, "", "", ""},
+		{"valid with mixed Rekor v2 and v3", options.KeyOpts{ExperimentalPQC: true, SigningConfig: mixedSC}, "", "", ""},
+		{"rejects --sk", options.KeyOpts{ExperimentalPQC: true, Sk: true, SigningConfig: v3SC}, "", "", "--sk"},
+		{"rejects --certificate", options.KeyOpts{ExperimentalPQC: true, SigningConfig: v3SC}, "cert.pem", "", "--certificate"},
+		{"rejects --certificate-chain", options.KeyOpts{ExperimentalPQC: true, SigningConfig: v3SC}, "", "chain.pem", "--certificate"},
+		{"rejects --issue-certificate", options.KeyOpts{ExperimentalPQC: true, IssueCertificateForExistingKey: true, SigningConfig: v3SC}, "", "", "--issue-certificate"},
+		{"rejects TSA CACert", options.KeyOpts{ExperimentalPQC: true, TSAClientCACert: "ca.pem", SigningConfig: v3SC}, "", "", "timestamp authority"},
+		{"rejects TSA ClientCert", options.KeyOpts{ExperimentalPQC: true, TSAClientCert: "c.pem", SigningConfig: v3SC}, "", "", "timestamp authority"},
+		{"rejects TSA ClientKey", options.KeyOpts{ExperimentalPQC: true, TSAClientKey: "k.pem", SigningConfig: v3SC}, "", "", "timestamp authority"},
+		{"rejects TSA ServerName", options.KeyOpts{ExperimentalPQC: true, TSAServerName: "tsa.local", SigningConfig: v3SC}, "", "", "timestamp authority"},
+		{"rejects --signing-algorithm", options.KeyOpts{ExperimentalPQC: true, SigningAlgorithm: "ecdsa-sha2-256-nistp256", SigningConfig: v3SC}, "", "", "--signing-algorithm"},
+		{"rejects nil SigningConfig", options.KeyOpts{ExperimentalPQC: true}, "", "", "signing config"},
+		{"rejects empty SigningConfig", options.KeyOpts{ExperimentalPQC: true, SigningConfig: NewEmptySigningConfig()}, "", "", "Rekor v3"},
+		{"rejects Rekor v2 only", options.KeyOpts{ExperimentalPQC: true, SigningConfig: v2SC}, "", "", "Rekor v3"},
+		{"rejects expired Rekor v3", options.KeyOpts{ExperimentalPQC: true, SigningConfig: expiredV3SC}, "", "", "Rekor v3"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePQCSigningOpts(tc.ko, tc.cert, tc.certChain)
+			if tc.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestWarnExperimentalPQCAndPrivacyStatement(t *testing.T) {
+	var errBuf strings.Builder
+	ctx := ui.WithEnv(t.Context(), &ui.Env{Stderr: &errBuf})
+	WarnExperimentalPQC(ctx)
+	assert.Contains(t, errBuf.String(), "EXPERIMENTAL PQC SIGNING ENABLED")
+
+	// ConfirmPrivacyStatement triggers for PQC staging Rekor v3 (.sigstage.dev).
+	privacy.StatementOnce = sync.Once{}
+	t.Cleanup(func() { privacy.StatementOnce = sync.Once{} })
+
+	var infoBuf strings.Builder
+	ctx = ui.WithEnv(t.Context(), &ui.Env{Stderr: &infoBuf})
+	stagingSC := makeRekorSigningConfig(t, "https://rekor.v2.sigstage.dev", 3)
+	err := ConfirmPrivacyStatement(ctx, options.KeyOpts{
+		ExperimentalPQC:  true,
+		SigningConfig:    stagingSC,
+		SkipConfirmation: true,
+	})
+	assert.NoError(t, err)
+	assert.Contains(t, infoBuf.String(), privacy.Statement)
+}
+
+func TestGetIdentityCredential(t *testing.T) {
+	td := t.TempDir()
+
+	t.Run("rejects security key directly", func(t *testing.T) {
+		_, _, err := GetIdentityCredential(t.Context(), options.KeyOpts{ExperimentalPQC: true, Sk: true})
+		assert.ErrorContains(t, err, "--sk")
+	})
+
+	t.Run("keyless OIDC uses IDToken without generating key", func(t *testing.T) {
+		tokenPath := filepath.Join(td, "id-token")
+		if err := os.WriteFile(tokenPath, []byte("test-oidc-token"), 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		cred, cleanup, err := GetIdentityCredential(t.Context(), options.KeyOpts{
+			ExperimentalPQC: true,
+			IDToken:         tokenPath,
+		})
+		if err != nil {
+			t.Fatalf("GetIdentityCredential: %v", err)
+		}
+		defer cleanup()
+		oidcCred, ok := cred.(*sign.OIDCCredential)
+		assert.True(t, ok)
+		assert.Equal(t, "test-oidc-token", oidcCred.Token)
+	})
+
+	t.Run("managed ML-DSA-44 key succeeds", func(t *testing.T) {
+		algo, err := signature.GetAlgorithmDetails(v1.PublicKeyDetails_ML_DSA_44)
+		assert.NoError(t, err)
+		keys, err := cosign.GenerateKeyPairWithAlgorithm(&algo, pass("pqc"))
+		assert.NoError(t, err)
+		keyPath := filepath.Join(td, "mldsa44.key")
+		assert.NoError(t, os.WriteFile(keyPath, keys.PrivateBytes, 0600))
+
+		cred, cleanup, err := GetIdentityCredential(t.Context(), options.KeyOpts{
+			ExperimentalPQC: true,
+			KeyRef:          keyPath,
+			PassFunc:        pass("pqc"),
+		})
+		if err != nil {
+			t.Fatalf("GetIdentityCredential: %v", err)
+		}
+		defer cleanup()
+		pkCred, ok := cred.(*sign.PublicKeyCredential)
+		assert.True(t, ok)
+		assert.NotNil(t, pkCred.Keypair)
+	})
+
+	t.Run("managed ECDSA key rejected", func(t *testing.T) {
+		keys, err := cosign.GenerateKeyPair(pass("ecdsa"))
+		assert.NoError(t, err)
+		keyPath := filepath.Join(td, "ecdsa.key")
+		assert.NoError(t, os.WriteFile(keyPath, keys.PrivateBytes, 0600))
+
+		_, _, err = GetIdentityCredential(t.Context(), options.KeyOpts{
+			ExperimentalPQC: true,
+			KeyRef:          keyPath,
+			PassFunc:        pass("ecdsa"),
+		})
+		assert.ErrorContains(t, err, "requires an ML-DSA-44 key")
+	})
+
+	for _, tc := range []struct {
+		name   string
+		params mldsa.Parameters
+	}{
+		{"ML-DSA-65", mldsa.MLDSA65()},
+		{"ML-DSA-87", mldsa.MLDSA87()},
+	} {
+		t.Run("managed "+tc.name+" key rejected with future-support message", func(t *testing.T) {
+			priv, err := mldsa.GenerateKey(tc.params)
+			assert.NoError(t, err)
+			der, err := x509.MarshalPKCS8PrivateKey(priv)
+			assert.NoError(t, err)
+			enc, err := encrypted.Encrypt(der, []byte("pqc"))
+			assert.NoError(t, err)
+			keyPEM := pem.EncodeToMemory(&pem.Block{Type: cosign.SigstorePrivateKeyPemType, Bytes: enc})
+			keyPath := filepath.Join(td, tc.name+".key")
+			assert.NoError(t, os.WriteFile(keyPath, keyPEM, 0600))
+
+			_, _, err = GetIdentityCredential(t.Context(), options.KeyOpts{
+				ExperimentalPQC: true,
+				KeyRef:          keyPath,
+				PassFunc:        pass("pqc"),
+			})
+			assert.True(t, errors.Is(err, cosign.ErrUnsupportedMLDSAParameters), "got err: %v", err)
+		})
+	}
+}
+
+func startMockRekorV3(t *testing.T) *httptest.Server {
+	t.Helper()
+	logPriv, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		t.Fatalf("mldsa.GenerateKey: %v", err)
+	}
+	const origin = "rekor-v3.local"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v2/log/entries" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var req pbrekor.IdentityRequestV001
+		if err := protojson.Unmarshal(body, &req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(req.GetMessage()) != sha256.Size {
+			http.Error(w, "invalid message digest length", http.StatusBadRequest)
+			return
+		}
+		msgHash := sha256.Sum256(req.GetMessage())
+		leafHash := rfc6962.DefaultHasher.HashLeaf(msgHash[:])
+		cp := formatsLog.Checkpoint{Origin: origin, Size: 1, Hash: leafHash}
+		signer, err := signature.LoadDefaultSigner(logPriv)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		noteSigner, err := note.NewNoteSigner(r.Context(), origin, signer)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		signedNote, err := sumdbNote.Sign(&sumdbNote.Note{Text: string(cp.Marshal())}, noteSigner)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		p := proof.TLogProof{Index: 0, Checkpoint: signedNote}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(p.Marshal())
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestNewAttestationBundle_ExperimentalPQC(t *testing.T) {
+	srv := startMockRekorV3(t)
+	sc := makeRekorSigningConfig(t, srv.URL, 3)
+
+	// ExperimentalPQC must fail closed if TUF cannot supply a trusted root and --trusted-root is omitted.
+	td := t.TempDir()
+	scBytes, err := sc.MarshalJSON()
+	assert.NoError(t, err)
+	scPath := filepath.Join(td, "sc.json")
+	assert.NoError(t, os.WriteFile(scPath, scBytes, 0600))
+	t.Setenv("TUF_ROOT", td)
+	t.Setenv("TUF_MIRROR", "https://tuf.example.invalid")
+	koNoTR := options.KeyOpts{ExperimentalPQC: true}
+	assert.ErrorContains(t, LoadSigningConfigAndTrustedMaterial(t.Context(), &koNoTR, false, scPath, ""), "loading trusted root for --experimental-pqc")
+
+	tokenPath := filepath.Join(td, "oidc-token")
+	assert.NoError(t, os.WriteFile(tokenPath, []byte("test-token"), 0600))
+	algo, err := signature.GetAlgorithmDetails(v1.PublicKeyDetails_ML_DSA_44)
+	assert.NoError(t, err)
+	keys, err := cosign.GenerateKeyPairWithAlgorithm(&algo, pass("pqc"))
+	assert.NoError(t, err)
+	keyPath := filepath.Join(td, "mldsa44.key")
+	assert.NoError(t, os.WriteFile(keyPath, keys.PrivateBytes, 0600))
+	payload := []byte(`{"_type":"https://in-toto.io/Statement/v1","predicateType":"https://sigstore.dev/cosign/sign/v1"}`)
+
+	for _, tc := range []struct {
+		name    string
+		ko      options.KeyOpts
+		wantSig bool
+	}{
+		{"OIDC keyless attestation v2 bundle", options.KeyOpts{ExperimentalPQC: true, IDToken: tokenPath, SigningConfig: sc}, false},
+		{"managed ML-DSA-44 key attestation v2 bundle", options.KeyOpts{ExperimentalPQC: true, KeyRef: keyPath, PassFunc: pass("pqc"), SigningConfig: sc}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NewAttestationBundle(t.Context(), tc.ko, "", "", CommonBundleOpts{Payload: payload}, sc, nil)
+			assert.NoError(t, err)
+			var pb bundleV2.Bundle
+			assert.NoError(t, protojson.Unmarshal(got, &pb))
+			assert.Equal(t, cbundle.BundleV20MediaType, pb.GetMediaType())
+			assert.Equal(t, payload, pb.GetPayload().GetPayload())
+			assert.Equal(t, tc.wantSig, len(pb.GetVerificationMaterial().GetTransparencyLogProof().GetSignature().GetSignature()) > 0)
 		})
 	}
 }

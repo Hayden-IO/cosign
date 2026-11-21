@@ -45,6 +45,7 @@ type SignBlobOptions struct {
 	NoSigningConfig   bool
 	SigningConfigPath string
 	TrustedRootPath   string
+	ExperimentalPQC   bool
 }
 
 var _ Interface = (*SignBlobOptions)(nil)
@@ -113,4 +114,7 @@ func (o *SignBlobOptions) AddFlags(cmd *cobra.Command) {
 	keyAlgorithmHelp := fmt.Sprintf("signing algorithm to use for signing/hashing (allowed %s)", strings.Join(keyAlgorithmTypes, ", "))
 	defaultKeyFlag, _ := signature.FormatSignatureAlgorithmFlag(v1.PublicKeyDetails_PKIX_ECDSA_P256_SHA_256)
 	cmd.Flags().StringVar(&o.SigningAlgorithm, "signing-algorithm", defaultKeyFlag, keyAlgorithmHelp)
+
+	cmd.Flags().BoolVar(&o.ExperimentalPQC, "experimental-pqc", false, ExperimentalPQCFlagUsage)
+	cmd.MarkFlagsMutuallyExclusive("experimental-pqc", "no-signing-config")
 }

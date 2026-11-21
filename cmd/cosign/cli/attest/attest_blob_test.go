@@ -334,3 +334,10 @@ func TestStatementPath(t *testing.T) {
 	err := at.Exec(ctx, "")
 	assert.NoError(t, err)
 }
+
+func TestAttestBlobCommand_ExperimentalPQCValidation(t *testing.T) {
+	at := AttestBlobCommand{ExperimentalPQC: true, StatementPath: "nonexistent.json"}
+	assert.ErrorContains(t, at.Exec(t.Context(), ""), "--bundle must be provided with --experimental-pqc")
+	at.BundlePath = filepath.Join(t.TempDir(), "bundle.json")
+	assert.ErrorContains(t, at.Exec(t.Context(), ""), "--experimental-pqc requires an active Rekor v3 transparency log")
+}

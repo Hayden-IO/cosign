@@ -18,12 +18,22 @@ package sign
 import (
 	"encoding/json"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	intotov1 "github.com/in-toto/attestation/go/v1"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/generate"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v3/internal/ui"
+	"github.com/sigstore/cosign/v3/pkg/cosign"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	"github.com/sigstore/cosign/v3/pkg/types"
+	bundleV2 "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v2"
+	v1 "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
+	"github.com/sigstore/sigstore/pkg/signature"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -86,4 +96,66 @@ func TestInTotoStatementHasPredicate(t *testing.T) {
 	if _, ok := result["predicateType"]; !ok {
 		t.Error("in-toto statement must contain a 'predicateType' field")
 	}
+}
+
+func TestSignCmd_ExperimentalPQC(t *testing.T) {
+	t.Run("nil SigningConfig fails closed with init hint", func(t *testing.T) {
+		err := SignCmd(t.Context(), nil, options.KeyOpts{ExperimentalPQC: true}, options.SignOptions{}, nil)
+		if err == nil || !strings.Contains(err.Error(), "cosign initialize --experimental-pqc-staging") {
+			t.Fatalf("expected Rekor v3 init hint error, got: %v", err)
+		}
+	})
+
+	sc := startTestRekorV3Server(t)
+	algo, err := signature.GetAlgorithmDetails(v1.PublicKeyDetails_ML_DSA_44)
+	if err != nil {
+		t.Fatalf("GetAlgorithmDetails: %v", err)
+	}
+	keys, err := cosign.GenerateKeyPairWithAlgorithm(&algo, nil)
+	if err != nil {
+		t.Fatalf("GenerateKeyPairWithAlgorithm: %v", err)
+	}
+	td := t.TempDir()
+	keyPath := writeFile(t, td, string(keys.PrivateBytes), "mldsa44.key")
+	imgDigest := "127.0.0.1:1/repo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+	t.Run("signs image digest to local v2 bundle with nil RootOptions", func(t *testing.T) {
+		outPath := filepath.Join(td, "sign-v2.sigstore.json")
+		ko := options.KeyOpts{
+			ExperimentalPQC:  true,
+			KeyRef:           keyPath,
+			SigningConfig:    sc,
+			SkipConfirmation: true,
+		}
+		so := options.SignOptions{BundlePath: outPath, Upload: false}
+		if err := SignCmd(t.Context(), nil, ko, so, []string{imgDigest}); err != nil {
+			t.Fatalf("SignCmd: %v", err)
+		}
+		b, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatalf("read bundle: %v", err)
+		}
+		var pb bundleV2.Bundle
+		if err := protojson.Unmarshal(b, &pb); err != nil {
+			t.Fatalf("protojson.Unmarshal: %v", err)
+		}
+		if pb.GetMediaType() != cbundle.BundleV20MediaType {
+			t.Errorf("MediaType = %q, want %q", pb.GetMediaType(), cbundle.BundleV20MediaType)
+		}
+	})
+
+	t.Run("declining private repo tlog upload fails closed", func(t *testing.T) {
+		ctx := ui.WithEnv(t.Context(), &ui.Env{Stdin: strings.NewReader("n\n"), Stderr: io.Discard})
+		ko := options.KeyOpts{
+			ExperimentalPQC:  true,
+			KeyRef:           keyPath,
+			SigningConfig:    sc,
+			SkipConfirmation: false,
+		}
+		so := options.SignOptions{BundlePath: filepath.Join(td, "declined.json"), Upload: false}
+		err := SignCmd(ctx, nil, ko, so, []string{imgDigest})
+		if err == nil || !strings.Contains(err.Error(), "--experimental-pqc requires uploading to a Rekor v3 transparency log") {
+			t.Fatalf("expected tlog required error on decline, got: %v", err)
+		}
+	})
 }

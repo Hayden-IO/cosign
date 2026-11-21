@@ -52,11 +52,52 @@ func getPayload(ctx context.Context, payloadPath string, hashFunction crypto.Has
 func SignBlobCmd(ctx context.Context, ro *options.RootOptions, ko options.KeyOpts, payloadPath, certPath, certChainPath string) error {
 	var payload internal.HashReader
 
-	ctx, cancel := context.WithTimeout(ctx, ro.Timeout)
-	defer cancel()
+	if ro != nil && ro.Timeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, ro.Timeout)
+		defer cancel()
+	}
 
 	if ko.SigningConfig == nil {
 		ko.SigningConfig = signcommon.NewEmptySigningConfig()
+	}
+	if ko.ExperimentalPQC {
+		signcommon.WarnExperimentalPQC(ctx)
+		if err := signcommon.ValidatePQCSigningOpts(ko, certPath, certChainPath); err != nil {
+			return err
+		}
+		if ko.BundlePath == "" {
+			return fmt.Errorf("--bundle path is required with --experimental-pqc")
+		}
+		if err := signcommon.ConfirmPrivacyStatement(ctx, ko); err != nil {
+			return err
+		}
+		cred, cleanup, err := signcommon.GetIdentityCredential(ctx, ko)
+		if err != nil {
+			return fmt.Errorf("getting identity credential: %w", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		payload, closePayload, err := getPayload(ctx, payloadPath, crypto.Hash(0))
+		if err != nil {
+			return fmt.Errorf("getting payload: %w", err)
+		}
+		defer closePayload()
+		data, err := io.ReadAll(&payload)
+		if err != nil {
+			return fmt.Errorf("reading payload: %w", err)
+		}
+		content := &sign.PlainData{Data: data}
+		bundleBytes, err := cbundle.SignIdentityData(ctx, content, cred, ko.SigningConfig, ko.TrustedMaterial)
+		if err != nil {
+			return fmt.Errorf("signing PQC bundle: %w", err)
+		}
+		if err := os.WriteFile(filepath.Clean(ko.BundlePath), bundleBytes, 0600); err != nil {
+			return fmt.Errorf("create bundle file: %w", err)
+		}
+		ui.Infof(ctx, "Wrote bundle to file %s", ko.BundlePath)
+		return nil
 	}
 	if err := signcommon.RequireFulcioForCertificate(ko); err != nil {
 		return err

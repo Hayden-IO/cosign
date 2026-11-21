@@ -43,6 +43,7 @@ type AttestBlobOptions struct {
 	NoSigningConfig   bool
 	SigningConfigPath string
 	TrustedRootPath   string
+	ExperimentalPQC   bool
 }
 
 var _ Interface = (*AttestBlobOptions)(nil)
@@ -107,4 +108,7 @@ func (o *AttestBlobOptions) AddFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&o.IssueCertificate, "issue-certificate", false,
 		"issue a code signing certificate from Fulcio, even if a key is provided")
 	_ = cmd.Flags().MarkDeprecated("issue-certificate", "support for this flag will be removed in the future")
+
+	cmd.Flags().BoolVar(&o.ExperimentalPQC, "experimental-pqc", false, ExperimentalPQCFlagUsage)
+	cmd.MarkFlagsMutuallyExclusive("experimental-pqc", "no-signing-config")
 }

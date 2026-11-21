@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/mldsa"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -144,7 +145,7 @@ func ShouldUploadToTlog(ctx context.Context, ko options.KeyOpts, ref name.Refere
 // ConfirmPrivacyStatement prompts the user with the Sigstore privacy statement
 // if the operation will record data to a public transparency log.
 func ConfirmPrivacyStatement(ctx context.Context, ko options.KeyOpts) error {
-	isKeyless := (ko.KeyRef == "" && !ko.Sk) || ko.IssueCertificateForExistingKey
+	isKeyless := (!ko.ExperimentalPQC && ko.KeyRef == "" && !ko.Sk) || ko.IssueCertificateForExistingKey
 	// The privacy statement applies when publishing to the public Rekor
 	// transparency log or the public Fulcio Certificate Transparency (CT) log.
 	if hasPublicGoodRekorURL(ko.SigningConfig) ||
@@ -420,8 +421,145 @@ type CommonBundleOpts struct {
 	OCIRemoteOpts []ociremote.Option
 }
 
+// WarnExperimentalPQC emits a prominent warning to stderr when experimental
+// post-quantum signing is enabled.
+func WarnExperimentalPQC(ctx context.Context) {
+	ui.Warnf(ctx, "EXPERIMENTAL PQC SIGNING ENABLED: Post-quantum cryptography (ML-DSA / Rekor v3) and Bundle v2 are experimental and subject to breaking changes. Do not rely on these signatures for production workloads.")
+}
+
+// ValidatePQCFlags validates CLI flags that are incompatible with
+// --experimental-pqc without requiring a loaded SigningConfig.
+func ValidatePQCFlags(ko options.KeyOpts, cert, certChain string) error {
+	if !ko.ExperimentalPQC {
+		return nil
+	}
+	if ko.Sk {
+		return errors.New("--sk (security key) is not supported with --experimental-pqc")
+	}
+	if cert != "" || certChain != "" {
+		return errors.New("--certificate and --certificate-chain are not supported with --experimental-pqc")
+	}
+	if ko.IssueCertificateForExistingKey {
+		return errors.New("--issue-certificate is not supported with --experimental-pqc")
+	}
+	if ko.TSAClientCACert != "" || ko.TSAClientCert != "" || ko.TSAClientKey != "" || ko.TSAServerName != "" {
+		return errors.New("timestamp authority flags are not supported with --experimental-pqc")
+	}
+	if ko.SigningAlgorithm != "" {
+		return errors.New("--signing-algorithm is not supported with --experimental-pqc")
+	}
+	return nil
+}
+
+// ValidatePQCSigningOpts validates signing options when --experimental-pqc is enabled.
+func ValidatePQCSigningOpts(ko options.KeyOpts, cert, certChain string) error {
+	if err := ValidatePQCFlags(ko, cert, certChain); err != nil {
+		return err
+	}
+	if !ko.ExperimentalPQC {
+		return nil
+	}
+	if ko.SigningConfig == nil {
+		return errors.New("--experimental-pqc requires a signing config with a Rekor v3 transparency log")
+	}
+	if _, err := root.SelectService(ko.SigningConfig.RekorLogURLs(), sign.IdentityRekorAPIVersions, time.Now()); err != nil {
+		return fmt.Errorf("--experimental-pqc requires an active Rekor v3 transparency log in signing config (run 'cosign initialize --experimental-pqc-staging' or provide --signing-config): %w", err)
+	}
+	return nil
+}
+
+// GetIdentityCredential constructs a sign.IdentityCredential for transparent PQC
+// signing (OIDC keyless or managed ML-DSA-44 key). Callers must invoke the
+// returned cleanup function when non-nil.
+func GetIdentityCredential(ctx context.Context, ko options.KeyOpts) (sign.IdentityCredential, func(), error) {
+	if ko.Sk {
+		return nil, nil, errors.New("--sk (security key) is not supported with --experimental-pqc")
+	}
+	if ko.KeyRef == "" {
+		var oidcServices []root.Service
+		if ko.SigningConfig != nil {
+			oidcServices = ko.SigningConfig.OIDCProviderURLs()
+		}
+		idToken, err := auth.RetrieveIDToken(ctx, auth.IDTokenConfig{
+			TokenOrPath:      ko.IDToken,
+			DisableProviders: ko.OIDCDisableProviders,
+			Provider:         ko.OIDCProvider,
+			AuthFlow:         ko.FulcioAuthFlow,
+			OIDCServices:     oidcServices,
+			ClientID:         ko.OIDCClientID,
+			ClientSecret:     ko.OIDCClientSecret,
+			RedirectURL:      ko.OIDCRedirectURL,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("retrieving ID token: %w", err)
+		}
+		return &sign.OIDCCredential{Token: idToken}, func() {}, nil
+	}
+
+	sv, err := sigs.SignerVerifierFromKeyRef(ctx, ko.KeyRef, ko.PassFunc, ko.DefaultLoadOptions)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading key: %w", err)
+	}
+	cleanup := func() {
+		if closer, ok := sv.(interface{ Close() }); ok {
+			closer.Close()
+		}
+	}
+	pubKey, err := sv.PublicKey()
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("getting public key: %w", err)
+	}
+	mldsaPub, ok := pubKey.(*mldsa.PublicKey)
+	if !ok {
+		cleanup()
+		return nil, nil, fmt.Errorf("--experimental-pqc requires an ML-DSA-44 key (generate one with 'cosign generate-key-pair --algorithm mldsa-44'), got %T", pubKey)
+	}
+	params, err := cryptoutils.ValidateMLDSAPublicKey(mldsaPub)
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("invalid ML-DSA public key: %w", err)
+	}
+	if params != mldsa.MLDSA44() {
+		cleanup()
+		return nil, nil, fmt.Errorf("unsupported ML-DSA parameters %s: %w", params, cosign.ErrUnsupportedMLDSAParameters)
+	}
+	kp, err := key.NewSignerVerifierKeypair(sv, ko.DefaultLoadOptions)
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("creating signerverifier keypair: %w", err)
+	}
+	return &sign.PublicKeyCredential{Keypair: kp}, kp.Close, nil
+}
+
 // NewAttestationBundle uses signing config and trusted root to sign an attestation and create a bundle.
 func NewAttestationBundle(ctx context.Context, ko options.KeyOpts, cert, certChain string, bundleOpts CommonBundleOpts, signingConfig *root.SigningConfig, trustedMaterial root.TrustedMaterial) ([]byte, error) {
+	if ko.ExperimentalPQC {
+		koCopy := ko
+		if signingConfig != nil {
+			koCopy.SigningConfig = signingConfig
+		}
+		if err := ValidatePQCSigningOpts(koCopy, cert, certChain); err != nil {
+			return nil, err
+		}
+		cred, cleanup, err := GetIdentityCredential(ctx, koCopy)
+		if err != nil {
+			return nil, fmt.Errorf("getting identity credential: %w", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+		content := &sign.DSSEData{
+			Data:        bundleOpts.Payload,
+			PayloadType: "application/vnd.in-toto+json",
+		}
+		bundle, err := cbundle.SignIdentityData(ctx, content, cred, koCopy.SigningConfig, trustedMaterial)
+		if err != nil {
+			return nil, fmt.Errorf("signing PQC bundle: %w", err)
+		}
+		return bundle, nil
+	}
+
 	keypair, certBytes, chainBytes, idToken, err := GetKeypairAndToken(ctx, ko, cert, certChain)
 	if err != nil {
 		return nil, fmt.Errorf("getting keypair and token: %w", err)
@@ -504,8 +642,14 @@ func LoadSigningConfigAndTrustedMaterial(ctx context.Context, ko *options.KeyOpt
 	} else if signingConfigHasServices(ko.SigningConfig) {
 		ko.TrustedMaterial, err = cosign.TrustedRoot()
 		if err != nil {
+			if ko.ExperimentalPQC {
+				return fmt.Errorf("loading trusted root for --experimental-pqc self-verification (specify --trusted-root or initialize a PQC TUF root): %w", err)
+			}
 			ui.Warnf(ctx, "Could not fetch trusted_root.json from the TUF repository. Continuing without trusted root. Error from TUF: %v", err)
 		}
+	}
+	if ko.ExperimentalPQC && ko.TrustedMaterial == nil {
+		return fmt.Errorf("trusted root is required for --experimental-pqc self-verification (specify --trusted-root or initialize a PQC TUF root)")
 	}
 
 	return nil
@@ -514,6 +658,10 @@ func LoadSigningConfigAndTrustedMaterial(ctx context.Context, ko *options.KeyOpt
 // RequireFulcioForCertificate returns an error when keyless or certificate-based signing is
 // requested and the signing config has no Fulcio certificate authority.
 func RequireFulcioForCertificate(ko options.KeyOpts) error {
+	if ko.ExperimentalPQC {
+		// Transparent PQC OIDC signing submits directly to Rekor v3 and does not use Fulcio.
+		return nil
+	}
 	var signType string
 	switch {
 	case ko.KeyRef == "" && !ko.Sk:

@@ -99,6 +99,13 @@ func Attest() *cobra.Command {
 				TSAServerName:                  o.TSAServerName,
 				IssueCertificateForExistingKey: o.IssueCertificate,
 				BundlePath:                     o.BundlePath,
+				ExperimentalPQC:                o.ExperimentalPQC,
+			}
+			if o.ExperimentalPQC && o.NoSigningConfig {
+				return fmt.Errorf("--experimental-pqc cannot be used with --no-signing-config")
+			}
+			if err := signcommon.ValidatePQCFlags(ko, o.Cert, o.CertChain); err != nil {
+				return err
 			}
 			if err := signcommon.LoadSigningConfigAndTrustedMaterial(cmd.Context(), &ko, o.NoSigningConfig, o.SigningConfigPath, o.TrustedRootPath); err != nil {
 				return err
