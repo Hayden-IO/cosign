@@ -18,6 +18,7 @@ package remote
 import (
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
@@ -61,7 +62,8 @@ func Signatures(ref name.Reference, opts ...Option) (oci.Signatures, error) {
 // limit is distinguishable from a payload that is exactly the maximum size.
 func readCapped(r io.Reader) ([]byte, error) {
 	maxSize := payloadsize.MaxSize()
-	b, err := io.ReadAll(io.LimitReader(r, int64(maxSize)+1))
+	limit := min(maxSize, uint64(math.MaxInt64-1))
+	b, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +73,9 @@ func readCapped(r io.Reader) ([]byte, error) {
 	return b, nil
 }
 
-func Bundle(ref name.Reference, opts ...Option) (*sgbundle.Bundle, error) {
+// BundleBytes fetches the raw JSON bytes of a single-layer Sigstore bundle
+// referrer image (v1 or v2), enforcing declared and decompressed payload size limits.
+func BundleBytes(ref name.Reference, opts ...Option) ([]byte, error) {
 	o := makeOptions(ref.Context(), opts...)
 	img, err := remoteImage(ref, o.ROpt...)
 	if err != nil {
@@ -106,7 +110,12 @@ func Bundle(ref name.Reference, opts ...Option) (*sgbundle.Bundle, error) {
 	// The size checked above is the compressed size the registry declares, and this
 	// is the only bundle read that goes through Uncompressed, so that check alone
 	// does not bound the result.
-	bundleBytes, err := readCapped(layer0)
+	return readCapped(layer0)
+}
+
+func Bundle(ref name.Reference, opts ...Option) (*sgbundle.Bundle, error) {
+	o := makeOptions(ref.Context(), opts...)
+	bundleBytes, err := BundleBytes(ref, opts...)
 	if err != nil {
 		return nil, err
 	}

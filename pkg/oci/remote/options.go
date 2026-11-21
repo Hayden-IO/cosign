@@ -178,3 +178,9 @@ func WithBundleOptions(opts ...sgbundle.Option) Option {
 		o.BundleOpts = append(o.BundleOpts, opts...)
 	}
 }
+
+// BundleOptionsFromOptions extracts the sigstore-go bundle options set via
+// WithBundleOptions in the provided options.
+func BundleOptionsFromOptions(opts ...Option) []sgbundle.Option {
+	return makeOptions(name.Repository{}, opts...).BundleOpts
+}

@@ -27,6 +27,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,7 +44,9 @@ import (
 	ggcrlayout "github.com/google/go-containerregistry/pkg/v1/layout"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/nozzle/throttler"
+	"github.com/secure-systems-lab/go-securesystemslib/dsse"
 	"github.com/sigstore/cosign/v3/internal/pkg/cosign"
+	payloadsize "github.com/sigstore/cosign/v3/internal/pkg/cosign/payload/size"
 	"github.com/sigstore/cosign/v3/internal/ui"
 	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	"github.com/sigstore/cosign/v3/pkg/oci"
@@ -66,7 +70,6 @@ import (
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/tuf"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // Identity specifies an issuer/subject to verify a signature against.
@@ -159,12 +162,15 @@ type CheckOpts struct {
 	// AllowCertificateChain permits bundles with version >= v0.3 to contain
 	// X.509 certificate chains in the verification material.
 	AllowCertificateChain bool
+	// PQCOnly, when true, accepts only v2 bundles with post-quantum signatures
+	// and rejects v1 bundles.
+	PQCOnly bool
 }
 
 // BundleOptions returns sigstore-go bundle options based on CheckOpts.
 func (co *CheckOpts) BundleOptions() []sgbundle.Option {
 	var opts []sgbundle.Option
-	if co.AllowCertificateChain {
+	if co != nil && co.AllowCertificateChain {
 		opts = append(opts, sgbundle.AllowCertificateChain())
 	}
 	return opts
@@ -189,6 +195,38 @@ func (v *verifyTrustedMaterial) PublicKeyVerifiers() []root.TimeConstrainedVerif
 	return v.keyTrustedMaterial.PublicKeyVerifiers()
 }
 
+func (co *CheckOpts) buildCertificateIdentityPolicy() (verify.PolicyOption, error) {
+	if len(co.Identities) == 0 {
+		return nil, errors.New("at least one identity is required")
+	}
+	if len(co.Identities) > 1 {
+		return nil, fmt.Errorf("unsupported: multiple identities are not supported at this time")
+	}
+	sanMatcher, err := verify.NewSANMatcher(co.Identities[0].Subject, co.Identities[0].SubjectRegExp)
+	if err != nil {
+		return nil, err
+	}
+
+	issuerMatcher, err := verify.NewIssuerMatcher(co.Identities[0].Issuer, co.Identities[0].IssuerRegExp)
+	if err != nil {
+		return nil, err
+	}
+
+	extensions := certificate.Extensions{
+		GithubWorkflowTrigger:    co.CertGithubWorkflowTrigger,
+		GithubWorkflowSHA:        co.CertGithubWorkflowSha,
+		GithubWorkflowName:       co.CertGithubWorkflowName,
+		GithubWorkflowRepository: co.CertGithubWorkflowRepository,
+		GithubWorkflowRef:        co.CertGithubWorkflowRef,
+	}
+
+	certificateIdentities, err := verify.NewCertificateIdentity(sanMatcher, issuerMatcher, extensions)
+	if err != nil {
+		return nil, err
+	}
+	return verify.WithCertificateIdentity(certificateIdentities), nil
+}
+
 // verificationOptions returns the verification options for verifying with sigstore-go.
 func (co *CheckOpts) verificationOptions() (trustedMaterial root.TrustedMaterial, verifierOptions []verify.VerifierOption, policyOptions []verify.PolicyOption, err error) {
 	if co.TrustedMaterial == nil && co.SigVerifier == nil {
@@ -198,34 +236,11 @@ func (co *CheckOpts) verificationOptions() (trustedMaterial root.TrustedMaterial
 	policyOptions = make([]verify.PolicyOption, 0)
 
 	if len(co.Identities) > 0 {
-		var sanMatcher verify.SubjectAlternativeNameMatcher
-		var issuerMatcher verify.IssuerMatcher
-		if len(co.Identities) > 1 {
-			return nil, nil, nil, fmt.Errorf("unsupported: multiple identities are not supported at this time")
-		}
-		sanMatcher, err = verify.NewSANMatcher(co.Identities[0].Subject, co.Identities[0].SubjectRegExp)
+		certIDPolicy, err := co.buildCertificateIdentityPolicy()
 		if err != nil {
 			return nil, nil, nil, err
 		}
-
-		issuerMatcher, err = verify.NewIssuerMatcher(co.Identities[0].Issuer, co.Identities[0].IssuerRegExp)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-
-		extensions := certificate.Extensions{
-			GithubWorkflowTrigger:    co.CertGithubWorkflowTrigger,
-			GithubWorkflowSHA:        co.CertGithubWorkflowSha,
-			GithubWorkflowName:       co.CertGithubWorkflowName,
-			GithubWorkflowRepository: co.CertGithubWorkflowRepository,
-			GithubWorkflowRef:        co.CertGithubWorkflowRef,
-		}
-
-		certificateIdentities, err := verify.NewCertificateIdentity(sanMatcher, issuerMatcher, extensions)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		policyOptions = []verify.PolicyOption{verify.WithCertificateIdentity(certificateIdentities)}
+		policyOptions = []verify.PolicyOption{certIDPolicy}
 	}
 
 	// Wrap TrustedMaterial
@@ -409,7 +424,10 @@ func keyBytes(sig oci.Signature, co *CheckOpts) ([]byte, error) {
 // VerifyImageAttestations does all the main cosign checks in a loop, returning the verified attestations.
 // If there were no valid attestations, we return an error.
 func VerifyImageAttestations(ctx context.Context, signedImgRef name.Reference, co *CheckOpts, nameOpts ...name.Option) (checkedAttestations []oci.Signature, bundleVerified bool, err error) {
-	bundles, hash, err := GetBundles(ctx, signedImgRef, co.RegistryClientOpts, nameOpts...)
+	if co == nil {
+		return nil, false, errors.New("check options must not be nil")
+	}
+	bundles, hash, err := GetAllBundles(ctx, signedImgRef, co.RegistryClientOpts, nameOpts...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -420,7 +438,10 @@ func VerifyImageAttestations(ctx context.Context, signedImgRef name.Reference, c
 // returning the verified attestations.
 // If there were no valid signatures, we return an error.
 func VerifyLocalImageAttestations(ctx context.Context, path string, co *CheckOpts) (checkedAttestations []oci.Signature, bundleVerified bool, err error) {
-	bundles, hash, err := GetLocalBundles(path, co.BundleOptions()...)
+	if co == nil {
+		return nil, false, errors.New("check options must not be nil")
+	}
+	bundles, hash, err := GetAllLocalBundles(path, co.BundleOptions()...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -769,7 +790,9 @@ func correctAnnotations(wanted, have map[string]any) bool {
 	return true
 }
 
-func GetBundles(_ context.Context, signedImgRef name.Reference, registryClientOpts []ociremote.Option, nameOpts ...name.Option) ([]*sgbundle.Bundle, *v1.Hash, error) {
+// GetAllBundles retrieves both v1 (v0.3+) and v2 (v2.0) Sigstore bundles attached
+// to signedImgRef via OCI referrers.
+func GetAllBundles(_ context.Context, signedImgRef name.Reference, registryClientOpts []ociremote.Option, nameOpts ...name.Option) ([]*cbundle.LoadedBundle, *v1.Hash, error) {
 	// This is a carefully optimized sequence for fetching the signatures of the
 	// entity that minimizes registry requests when supplied with a digest input
 	digest, err := ociremote.ResolveDigest(signedImgRef, registryClientOpts...)
@@ -795,9 +818,15 @@ func GetBundles(_ context.Context, signedImgRef name.Reference, registryClientOp
 	if targetRepo := ociremote.TargetRepositoryFromOptions(registryClientOpts...); (targetRepo != name.Repository{}) {
 		bundleRepo = targetRepo
 	}
+	bundleOpts := ociremote.BundleOptionsFromOptions(registryClientOpts...)
 
-	var bundles = make([]*sgbundle.Bundle, 0, len(index.Manifests))
-	for _, result := range index.Manifests {
+	const maxBundleReferrers = 1000
+	manifests := index.Manifests
+	if len(manifests) > maxBundleReferrers {
+		manifests = manifests[:maxBundleReferrers]
+	}
+	bundles := make([]*cbundle.LoadedBundle, 0, len(manifests))
+	for _, result := range manifests {
 		var st name.Reference
 		if len(nameOpts) > 0 {
 			st, err = name.ParseReference(fmt.Sprintf("%s@%s", bundleRepo, result.Digest.String()), nameOpts...)
@@ -807,13 +836,20 @@ func GetBundles(_ context.Context, signedImgRef name.Reference, registryClientOp
 		} else {
 			st = bundleRepo.Digest(result.Digest.String())
 		}
-		bundle, err := ociremote.Bundle(st, registryClientOpts...)
+		bundleBytes, err := ociremote.BundleBytes(st, registryClientOpts...)
 		if err != nil {
 			// There may be non-Sigstore referrers in the index, so we can ignore them.
 			// TODO: Should we surface any errors here (e.g. if the bundle is invalid)?
 			continue
 		}
-		bundles = append(bundles, bundle)
+		loaded, err := cbundle.ParseBundle(bundleBytes, bundleOpts...)
+		if err != nil {
+			continue
+		}
+		if loaded.IsV1() && !loaded.V1.MinVersion("v0.3") {
+			continue
+		}
+		bundles = append(bundles, loaded)
 	}
 
 	if len(bundles) == 0 {
@@ -823,6 +859,31 @@ func GetBundles(_ context.Context, signedImgRef name.Reference, registryClientOp
 	}
 
 	return bundles, &h, nil
+}
+
+func filterV1Bundles(loaded []*cbundle.LoadedBundle, errMsg string) ([]*sgbundle.Bundle, error) {
+	bundles := make([]*sgbundle.Bundle, 0, len(loaded))
+	for _, b := range loaded {
+		if b.IsV1() {
+			bundles = append(bundles, b.V1)
+		}
+	}
+	if len(bundles) == 0 {
+		return nil, &ErrNoMatchingAttestations{errors.New(errMsg)}
+	}
+	return bundles, nil
+}
+
+func GetBundles(ctx context.Context, signedImgRef name.Reference, registryClientOpts []ociremote.Option, nameOpts ...name.Option) ([]*sgbundle.Bundle, *v1.Hash, error) {
+	loaded, hash, err := GetAllBundles(ctx, signedImgRef, registryClientOpts, nameOpts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	bundles, err := filterV1Bundles(loaded, "no valid bundles exist in registry")
+	if err != nil {
+		return nil, nil, err
+	}
+	return bundles, hash, nil
 }
 
 // bundleDescriptor holds the digest and path to a bundle blob in a local OCI layout
@@ -847,39 +908,87 @@ func HasLocalAttestationBundles(path string) (bool, error) {
 	return len(descriptors) > 0, nil
 }
 
-// GetLocalBundles retrieves v3 sigstore bundles from a local OCI layout.
-// Returns bundles, target image hash, and error. Invalid bundles are logged and skipped.
-func GetLocalBundles(path string, bundleOpts ...sgbundle.Option) ([]*sgbundle.Bundle, *v1.Hash, error) {
+func readLocalBundleBlob(blobsRoot *os.Root, name string) ([]byte, error) {
+	f, err := blobsRoot.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("blob %q is not a regular file", name)
+	}
+
+	maxSize := payloadsize.MaxSize()
+	limit := min(maxSize, uint64(math.MaxInt64-1))
+	b, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(b)) > maxSize {
+		return nil, payloadsize.NewMaxLayerSizeExceeded(uint64(len(b)), maxSize)
+	}
+	return b, nil
+}
+
+func isValidSHA256Digest(h v1.Hash) bool {
+	if h.Algorithm != "sha256" || len(h.Hex) != 64 || strings.ToLower(h.Hex) != h.Hex {
+		return false
+	}
+	_, err := hex.DecodeString(h.Hex)
+	return err == nil
+}
+
+// GetAllLocalBundles retrieves both v1 (v0.3+) and v2 (v2.0) Sigstore bundles from
+// a local OCI layout. Returns bundles, target image hash, and error. Invalid bundles
+// are logged and skipped.
+func GetAllLocalBundles(path string, bundleOpts ...sgbundle.Option) ([]*cbundle.LoadedBundle, *v1.Hash, error) {
 	descriptors, hash, err := getLocalBundleDescriptors(path)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	bundles := make([]*sgbundle.Bundle, 0, len(descriptors))
+	blobsDir := filepath.Join(path, "blobs", "sha256")
+	blobsRoot, err := os.OpenRoot(blobsDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, &ErrNoMatchingAttestations{fmt.Errorf("no valid bundles found in local layout")}
+		}
+		return nil, nil, fmt.Errorf("opening blobs directory: %w", err)
+	}
+	defer blobsRoot.Close()
+
+	bundles := make([]*cbundle.LoadedBundle, 0, len(descriptors))
 	for _, descriptor := range descriptors {
-		bundleBytes, err := os.ReadFile(filepath.Join(path, descriptor.blobPath))
+		if !isValidSHA256Digest(descriptor.digest) {
+			continue
+		}
+		data, err := readLocalBundleBlob(blobsRoot, descriptor.digest.Hex)
 		if err != nil {
-			ui.Warnf(context.Background(), "Failed to read bundle blob %s: %v", descriptor.digest.Hex, err)
+			ui.Warnf(context.Background(), "Failed to load bundle %s: %v", descriptor.digest.Hex, err)
+			continue
+		}
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != descriptor.digest.Hex {
+			ui.Warnf(context.Background(), "Bundle %s digest mismatch", descriptor.digest.Hex)
+			continue
+		}
+		loaded, err := cbundle.ParseBundle(data, bundleOpts...)
+		if err != nil {
+			ui.Warnf(context.Background(), "Failed to load bundle %s: %v", descriptor.digest.Hex, err)
 			continue
 		}
 
-		pb := &protobundle.Bundle{}
-		if err := protojson.Unmarshal(bundleBytes, pb); err != nil {
-			ui.Warnf(context.Background(), "Failed to unmarshal bundle %s: %v", descriptor.digest.Hex, err)
-			continue
-		}
-		bundle, err := sgbundle.NewBundle(pb, bundleOpts...)
-		if err != nil {
-			ui.Warnf(context.Background(), "Failed to create bundle %s: %v", descriptor.digest.Hex, err)
-			continue
-		}
-
-		if !bundle.MinVersion("v0.3") {
+		if loaded.IsV1() && !loaded.V1.MinVersion("v0.3") {
 			ui.Warnf(context.Background(), "Bundle %s version too old (requires v0.3+)", descriptor.digest.Hex)
 			continue
 		}
 
-		bundles = append(bundles, bundle)
+		bundles = append(bundles, loaded)
 	}
 
 	if len(bundles) == 0 {
@@ -888,6 +997,20 @@ func GetLocalBundles(path string, bundleOpts ...sgbundle.Option) ([]*sgbundle.Bu
 		}
 	}
 
+	return bundles, hash, nil
+}
+
+// GetLocalBundles retrieves v3 sigstore bundles from a local OCI layout.
+// Returns bundles, target image hash, and error. Invalid bundles are logged and skipped.
+func GetLocalBundles(path string, bundleOpts ...sgbundle.Option) ([]*sgbundle.Bundle, *v1.Hash, error) {
+	loaded, hash, err := GetAllLocalBundles(path, bundleOpts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	bundles, err := filterV1Bundles(loaded, "no valid bundles found in local layout")
+	if err != nil {
+		return nil, nil, err
+	}
 	return bundles, hash, nil
 }
 
@@ -944,14 +1067,19 @@ func getLocalBundleDescriptorsWithFilter(path string, isAttestation bool) ([]bun
 		}
 		return nil, nil, fmt.Errorf("reading blobs directory: %w", err)
 	}
+	blobsRoot, err := os.OpenRoot(blobsDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening blobs directory: %w", err)
+	}
+	defer blobsRoot.Close()
 
+	const maxLocalBundleDescriptors = 1000
 	var descriptors []bundleDescriptor
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		blobPath := filepath.Join(blobsDir, entry.Name())
-		data, err := os.ReadFile(blobPath)
+		data, err := readLocalBundleBlob(blobsRoot, entry.Name())
 		if err != nil {
 			continue
 		}
@@ -969,9 +1097,10 @@ func getLocalBundleDescriptorsWithFilter(path string, isAttestation bool) ([]bun
 			}
 			// Collect bundle layer descriptors from this referrer manifest
 			for _, layer := range blobManifest.Layers {
-				if strings.HasPrefix(string(layer.MediaType), "application/vnd.dev.sigstore.bundle") {
-					// layer.Digest.Hex is validated by go-containerregistry to be a valid hex hash,
-					// but use filepath.Clean for defense-in-depth against path traversal
+				if len(descriptors) >= maxLocalBundleDescriptors {
+					return descriptors, &targetDigest, nil
+				}
+				if strings.HasPrefix(string(layer.MediaType), "application/vnd.dev.sigstore.bundle") && isValidSHA256Digest(layer.Digest) {
 					descriptors = append(descriptors, bundleDescriptor{
 						digest:   layer.Digest,
 						blobPath: filepath.Clean(filepath.Join("blobs", "sha256", layer.Digest.Hex)),
@@ -984,11 +1113,17 @@ func getLocalBundleDescriptorsWithFilter(path string, isAttestation bool) ([]bun
 	return descriptors, &targetDigest, nil
 }
 
-// verifyImageAttestationsSigstoreBundles verifies attestations from attached sigstore bundles
-func verifyImageAttestationsSigstoreBundles(ctx context.Context, bundles []*sgbundle.Bundle, hash *v1.Hash, co *CheckOpts) (checkedAttestations []oci.Signature, atLeastOneBundleVerified bool, err error) {
+// verifyImageAttestationsSigstoreBundles verifies attestations from attached v1 and v2 sigstore bundles.
+func verifyImageAttestationsSigstoreBundles(ctx context.Context, bundles []*cbundle.LoadedBundle, hash *v1.Hash, co *CheckOpts) (checkedAttestations []oci.Signature, atLeastOneBundleVerified bool, err error) {
+	if co == nil {
+		return nil, false, errors.New("check options must not be nil")
+	}
 	// Enforce this up front.
-	if co.SigVerifier == nil && co.TrustedMaterial == nil {
+	if isNilInterface(co.SigVerifier) && isNilInterface(co.TrustedMaterial) {
 		return nil, false, errors.New("one of verifier or trusted root is required")
+	}
+	if hash == nil {
+		return nil, false, errors.New("image digest must not be nil")
 	}
 
 	digestBytes, err := hex.DecodeString(hash.Hex)
@@ -1007,20 +1142,52 @@ func verifyImageAttestationsSigstoreBundles(ctx context.Context, bundles []*sgbu
 	}
 	t := throttler.New(workers, len(bundles))
 	for i, bundle := range bundles {
-		go func(bundle *sgbundle.Bundle, index int) {
-			var att oci.Signature
-			if err := func(bundle *sgbundle.Bundle) error {
-				_, err := VerifyNewBundle(ctx, co, artifactPolicyOption, bundle)
-				if err != nil {
-					return err
-				}
-				dsse, ok := bundle.Content.(*protobundle.Bundle_DsseEnvelope)
-				if !ok {
-					return fmt.Errorf("bundle does not contain a DSSE envelope")
-				}
-				payload, err := json.Marshal(dsse.DsseEnvelope)
-				if err != nil {
-					return fmt.Errorf("marshaling DSSE envelope: %w", err)
+		go func(bundle *cbundle.LoadedBundle, index int) {
+			att, verifyErr := func(bundle *cbundle.LoadedBundle) (oci.Signature, error) {
+				var payload []byte
+				var err error
+				switch {
+				case bundle == nil:
+					return nil, errors.New("bundle must not be nil")
+				case bundle.V1 != nil && bundle.V2 != nil:
+					return nil, errors.New("loaded bundle cannot contain both v1 and v2 bundles")
+				case bundle.IsV1():
+					if _, err := VerifyNewBundle(ctx, co, artifactPolicyOption, bundle.V1); err != nil {
+						return nil, err
+					}
+					dsseEnv, ok := bundle.V1.Content.(*protobundle.Bundle_DsseEnvelope)
+					if !ok {
+						return nil, fmt.Errorf("bundle does not contain a DSSE envelope")
+					}
+					payload, err = json.Marshal(dsseEnv.DsseEnvelope)
+					if err != nil {
+						return nil, fmt.Errorf("marshaling DSSE envelope: %w", err)
+					}
+				case bundle.IsV2():
+					if _, err := VerifyBundleV2(ctx, co, artifactPolicyOption, bundle.V2); err != nil {
+						return nil, err
+					}
+					if !bundle.V2.HasEnvelope() {
+						return nil, fmt.Errorf("bundle does not contain a DSSE envelope")
+					}
+					env, err := bundle.V2.Envelope()
+					if err != nil {
+						return nil, fmt.Errorf("getting DSSE envelope from v2 bundle: %w", err)
+					}
+					rawEnv := env.RawEnvelope()
+					if rawEnv == nil {
+						return nil, fmt.Errorf("bundle does not contain a DSSE envelope")
+					}
+					envCopy := *rawEnv
+					if envCopy.Signatures == nil {
+						envCopy.Signatures = []dsse.Signature{}
+					}
+					payload, err = json.Marshal(&envCopy)
+					if err != nil {
+						return nil, fmt.Errorf("marshaling DSSE envelope: %w", err)
+					}
+				default:
+					return nil, errors.New("empty loaded bundle")
 				}
 
 				// We will return a slice of `[]oci.Signature` from this function for compatibility
@@ -1030,20 +1197,21 @@ func verifyImageAttestationsSigstoreBundles(ctx context.Context, bundles []*sgbu
 				// the payload (DSSE). TODO: Add additional data to returned `oci.Signature`. This
 				// can be done by passing a list of static.Option to NewAttestation (e.g. static.WithCertChain()).
 				// Depends on https://github.com/sigstore/sigstore-go/issues/328
-				att, err = static.NewAttestation(payload)
+				att, err := static.NewAttestation(payload)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				if co.ClaimVerifier != nil {
 					if err := co.ClaimVerifier(att, *hash, co.Annotations); err != nil {
-						return err
+						return nil, err
 					}
 				}
 				bundlesVerified[index] = true
 
-				return err
-			}(bundle); err != nil {
-				t.Done(err)
+				return att, nil
+			}(bundle)
+			if verifyErr != nil {
+				t.Done(verifyErr)
 				return
 			}
 
