@@ -22,8 +22,9 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/options"
 	"github.com/sigstore/cosign/v3/internal/ui"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	ociremote "github.com/sigstore/cosign/v3/pkg/oci/remote"
-	"github.com/sigstore/sigstore-go/pkg/bundle"
+	"github.com/sigstore/sigstore-go/pkg/verify"
 )
 
 func BundleCmd(ctx context.Context, regOpts options.RegistryOptions, bundlePaths []string, imageRef string) error {
@@ -51,7 +52,7 @@ func BundleCmd(ctx context.Context, regOpts options.RegistryOptions, bundlePaths
 	for _, bundlePath := range bundlePaths {
 		fmt.Fprintf(os.Stderr, "Using bundle from: %s\n", bundlePath)
 
-		b, err := bundle.LoadJSONFromPath(bundlePath)
+		b, err := cbundle.LoadBundleFromPath(bundlePath)
 		if err != nil {
 			return fmt.Errorf("loading bundle from %s: %w", bundlePath, err)
 		}
@@ -64,8 +65,19 @@ func BundleCmd(ctx context.Context, regOpts options.RegistryOptions, bundlePaths
 	return nil
 }
 
-func attachAttestationNewBundle(remoteOpts []ociremote.Option, b *bundle.Bundle, digest name.Digest) error {
-	envelope, err := b.Envelope()
+func attachAttestationNewBundle(remoteOpts []ociremote.Option, b *cbundle.LoadedBundle, digest name.Digest) error {
+	var (
+		envelope verify.EnvelopeContent
+		err      error
+	)
+	switch {
+	case b.IsV1():
+		envelope, err = b.V1.Envelope()
+	case b.IsV2():
+		envelope, err = b.V2.Envelope()
+	default:
+		return fmt.Errorf("bundle is empty")
+	}
 	if err != nil {
 		return err
 	}

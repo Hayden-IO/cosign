@@ -18,6 +18,7 @@ package bundle
 import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/asn1"
@@ -26,17 +27,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/digitorus/timestamp"
 	"github.com/google/certificate-transparency-go/x509util"
+	payloadsize "github.com/sigstore/cosign/v3/internal/pkg/cosign/payload/size"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
+	bundleV2 "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v2"
+	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	rekorv1 "github.com/sigstore/protobuf-specs/gen/pb-go/rekor/v1"
 	"github.com/sigstore/rekor/pkg/util"
 	"github.com/sigstore/sigstore-go/pkg/root"
+	"github.com/transparency-dev/formats/proof"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -130,23 +139,44 @@ func (c *InspectCmd) Exec() error {
 		fmt.Fprintf(os.Stderr, "Local TUF environment not initialized, some details will be omitted: %v\n", err)
 	}
 
-	f, err := os.Open(c.BundlePath)
+	if c.BundlePath == "" {
+		return fmt.Errorf("opening bundle file: bundle path must not be empty")
+	}
+	f, err := os.Open(filepath.Clean(c.BundlePath))
 	if err != nil {
 		return fmt.Errorf("opening bundle file: %w", err)
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(f)
+	maxSize := payloadsize.MaxSize()
+	limit := min(maxSize, uint64(math.MaxInt64-1))
+	data, err := io.ReadAll(io.LimitReader(f, int64(limit)+1))
 	if err != nil {
 		return fmt.Errorf("reading bundle: %w", err)
+	}
+	if uint64(len(data)) > maxSize {
+		return fmt.Errorf("reading bundle: %w", payloadsize.NewMaxLayerSizeExceeded(uint64(len(data)), maxSize))
+	}
+
+	out := c.Out
+	if out == nil {
+		out = os.Stdout
+	}
+	rootNode := &node{}
+	if peekBundleMediaType(data) == cbundle.BundleV20MediaType {
+		var b2 bundleV2.Bundle
+		if err := protojson.Unmarshal(data, &b2); err != nil {
+			return fmt.Errorf("unmarshaling v2 bundle: %w", err)
+		}
+		populateV2BundleSummary(rootNode, &b2, tr)
+		rootNode.print(out, 0)
+		return nil
 	}
 
 	var b protobundle.Bundle
 	if err := protojson.Unmarshal(data, &b); err != nil {
 		return fmt.Errorf("unmarshaling bundle: %w", err)
 	}
-
-	rootNode := &node{}
 
 	rootNode.addChild("Bundle Media Type", b.MediaType)
 	version, ok := recognizedMediaTypes[b.MediaType]
@@ -168,13 +198,29 @@ func (c *InspectCmd) Exec() error {
 		rootNode.addChild("[!] WARNING", "Missing Content")
 	}
 
-	out := c.Out
-	if out == nil {
-		out = os.Stdout
-	}
 	rootNode.print(out, 0)
 
 	return nil
+}
+
+func peekBundleMediaType(data []byte) string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+	mtRaw, hasCamel := raw["mediaType"]
+	mtSnake, hasSnake := raw["media_type"]
+	if (hasCamel && hasSnake) || (!hasCamel && !hasSnake) {
+		return ""
+	}
+	if !hasCamel {
+		mtRaw = mtSnake
+	}
+	var mediaType string
+	if err := json.Unmarshal(mtRaw, &mediaType); err != nil {
+		return ""
+	}
+	return mediaType
 }
 
 type node struct {
@@ -188,13 +234,30 @@ func (n *node) addChild(label, value string) *node {
 	return &n.Children[len(n.Children)-1]
 }
 
+func sanitizeDisplayString(s string) string {
+	if !strings.ContainsFunc(s, unicode.IsControl) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			fmt.Fprintf(&b, "\\x%02x", r)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func (n *node) print(w io.Writer, depth int) {
 	if n.Label != "" {
 		indent := strings.Repeat("  ", depth)
+		label := sanitizeDisplayString(n.Label)
 		if n.Value != "" {
-			fmt.Fprintf(w, "%s- %s: %s\n", indent, n.Label, n.Value)
+			fmt.Fprintf(w, "%s- %s: %s\n", indent, label, sanitizeDisplayString(n.Value))
 		} else {
-			fmt.Fprintf(w, "%s- %s:\n", indent, n.Label)
+			fmt.Fprintf(w, "%s- %s:\n", indent, label)
 		}
 		depth++
 	}
@@ -335,6 +398,19 @@ func populateCertificateSummary(n *node, rawBytes []byte, tr root.TrustedMateria
 	case *rsa.PublicKey:
 		spkiNode.addChild("Algorithm", "RSA")
 		spkiNode.addChild("Key Size", fmt.Sprintf("%d bits", pub.N.BitLen()))
+
+	case *mldsa.PublicKey:
+		spkiNode.addChild("Algorithm", "ML-DSA")
+		if pub != nil {
+			spkiNode.addChild("Parameters", pub.Parameters().String())
+			pubBytes := pub.Bytes()
+			pubHex := hex.EncodeToString(pubBytes)
+			if len(pubHex) > 20 {
+				spkiNode.addChild("Public Key", fmt.Sprintf("%s...%s (%d bytes)", pubHex[:8], pubHex[len(pubHex)-8:], len(pubBytes)))
+			} else {
+				spkiNode.addChild("Public Key", pubHex)
+			}
+		}
 
 	default:
 		spkiNode.addChild("Algorithm", "Unknown")
@@ -489,31 +565,7 @@ func populateTlogEntrySummary(n *node, entry *rekorv1.TransparencyLogEntry, tr r
 
 		if proof.Checkpoint != nil {
 			checkpointNode := proofNode.addChild("Checkpoint", "")
-			var sc util.SignedCheckpoint
-			if err := sc.UnmarshalText([]byte(proof.Checkpoint.Envelope)); err == nil {
-				checkpointNode.addChild("Origin", sc.Origin)
-				checkpointNode.addChild("Tree Size", fmt.Sprintf("%d", sc.Size))
-
-				if len(sc.OtherContent) > 0 {
-					otherNode := checkpointNode.addChild("Other Content", fmt.Sprintf("%d lines", len(sc.OtherContent)))
-					for i, line := range sc.OtherContent {
-						otherNode.addChild(fmt.Sprintf("[%d]", i), line)
-					}
-				}
-
-				if len(sc.Signatures) > 0 {
-					witnessesNode := checkpointNode.addChild("Witnesses", fmt.Sprintf("%d", len(sc.Signatures)))
-					for _, sig := range sc.Signatures {
-						sigBytes, err := base64.StdEncoding.DecodeString(sig.Base64)
-						sigNode := witnessesNode.addChild(sig.Name, fmt.Sprintf("Signature Present (%d bytes)", len(sigBytes)))
-						if err != nil {
-							sigNode.addChild("[!] WARNING", "Malformed Base64")
-						}
-					}
-				}
-			} else {
-				checkpointNode.addChild("Envelope", fmt.Sprintf("Present (%d bytes)", len(proof.Checkpoint.Envelope)))
-			}
+			populateSignedCheckpointSummary(checkpointNode, []byte(proof.Checkpoint.Envelope))
 		}
 	}
 
@@ -522,17 +574,72 @@ func populateTlogEntrySummary(n *node, entry *rekorv1.TransparencyLogEntry, tr r
 	}
 }
 
+func populateSignedCheckpointSummary(checkpointNode *node, raw []byte) {
+	var sc util.SignedCheckpoint
+	if err := sc.UnmarshalText(raw); err == nil {
+		checkpointNode.addChild("Origin", sc.Origin)
+		checkpointNode.addChild("Tree Size", fmt.Sprintf("%d", sc.Size))
+
+		if len(sc.OtherContent) > 0 {
+			otherNode := checkpointNode.addChild("Other Content", fmt.Sprintf("%d lines", len(sc.OtherContent)))
+			for i, line := range sc.OtherContent {
+				otherNode.addChild(fmt.Sprintf("[%d]", i), line)
+			}
+		}
+
+		if len(sc.Signatures) > 0 {
+			witnessesNode := checkpointNode.addChild("Witnesses", fmt.Sprintf("%d", len(sc.Signatures)))
+			for _, sig := range sc.Signatures {
+				sigBytes, err := base64.StdEncoding.DecodeString(sig.Base64)
+				sigNode := witnessesNode.addChild(sig.Name, fmt.Sprintf("Signature Present (%d bytes)", len(sigBytes)))
+				if err != nil {
+					sigNode.addChild("[!] WARNING", "Malformed Base64")
+				}
+			}
+		}
+	} else {
+		checkpointNode.addChild("Envelope", fmt.Sprintf("Present (%d bytes)", len(raw)))
+	}
+}
+
 func populateTimestampSummary(n *node, tsData *protobundle.TimestampVerificationData) {
-	n.addChild("RFC3161 Timestamps", fmt.Sprintf("%d", len(tsData.GetRfc3161Timestamps())))
-	for i, ts := range tsData.GetRfc3161Timestamps() {
+	populateRFC3161Timestamps(n, tsData.GetRfc3161Timestamps())
+}
+
+func populateRFC3161Timestamps(n *node, timestamps []*protocommon.RFC3161SignedTimestamp) {
+	n.addChild("RFC3161 Timestamps", fmt.Sprintf("%d", len(timestamps)))
+	for i, ts := range timestamps {
 		singleTsNode := n.addChild(fmt.Sprintf("Timestamp [%d]", i), "")
 
-		if parsedTs, err := timestamp.ParseResponse(ts.SignedTimestamp); err == nil {
+		if parsedTs, err := timestamp.ParseResponse(ts.GetSignedTimestamp()); err == nil {
 			singleTsNode.addChild("Time", parsedTs.Time.Format(time.RFC3339))
 			singleTsNode.addChild("Hash Algorithm", parsedTs.HashAlgorithm.String())
 			singleTsNode.addChild("Message Imprint", fmt.Sprintf("Present (%d bytes)", len(parsedTs.HashedMessage)))
 			singleTsNode.addChild("Serial Number", fmt.Sprintf("%s", parsedTs.SerialNumber))
 			singleTsNode.addChild("Policy", parsedTs.Policy.String())
+		}
+	}
+}
+
+func populateInTotoPayloadSummary(contentNode *node, payloadType string, payload []byte) {
+	if payloadType != "application/vnd.in-toto+json" {
+		return
+	}
+	var statement map[string]any
+	if err := json.Unmarshal(payload, &statement); err == nil {
+		payloadNode := contentNode.addChild("Payload Content (in-toto)", "")
+		if predicateType, ok := statement["predicateType"].(string); ok {
+			payloadNode.addChild("Predicate Type", predicateType)
+		}
+		if subjects, ok := statement["subject"].([]any); ok {
+			subjectsNode := payloadNode.addChild("Subjects", fmt.Sprintf("%d", len(subjects)))
+			for _, s := range subjects {
+				if subMap, ok := s.(map[string]any); ok {
+					if name, ok := subMap["name"].(string); ok {
+						subjectsNode.addChild("Name", name)
+					}
+				}
+			}
 		}
 	}
 }
@@ -545,25 +652,7 @@ func populateContentSummary(n *node, b *protobundle.Bundle) {
 		contentNode.addChild("Payload Type", content.DsseEnvelope.PayloadType)
 		contentNode.addChild("Payload", fmt.Sprintf("Present (%d bytes)", len(content.DsseEnvelope.Payload)))
 
-		if content.DsseEnvelope.PayloadType == "application/vnd.in-toto+json" {
-			var statement map[string]any
-			if err := json.Unmarshal(content.DsseEnvelope.Payload, &statement); err == nil {
-				payloadNode := contentNode.addChild("Payload Content (in-toto)", "")
-				if predicateType, ok := statement["predicateType"].(string); ok {
-					payloadNode.addChild("Predicate Type", predicateType)
-				}
-				if subjects, ok := statement["subject"].([]any); ok {
-					subjectsNode := payloadNode.addChild("Subjects", fmt.Sprintf("%d", len(subjects)))
-					for _, s := range subjects {
-						if subMap, ok := s.(map[string]any); ok {
-							if name, ok := subMap["name"].(string); ok {
-								subjectsNode.addChild("Name", name)
-							}
-						}
-					}
-				}
-			}
-		}
+		populateInTotoPayloadSummary(contentNode, content.DsseEnvelope.PayloadType, content.DsseEnvelope.Payload)
 
 		sigsNode := contentNode.addChild("Signatures", fmt.Sprintf("%d", len(content.DsseEnvelope.Signatures)))
 		if len(content.DsseEnvelope.Signatures) != 1 {
@@ -597,6 +686,180 @@ func populateContentSummary(n *node, b *protobundle.Bundle) {
 			digestNode.addChild("Digest", fmt.Sprintf("Present (%d bytes)", len(content.MessageSignature.MessageDigest.Digest)))
 		}
 		contentNode.addChild("Signature", fmt.Sprintf("Present (%d bytes)", len(content.MessageSignature.Signature)))
+	}
+}
+
+const (
+	maxV2ExtraDataBytes  = 64 * 1024
+	maxV2ExtraDataClaims = 64
+)
+
+func populateV2BundleSummary(n *node, b *bundleV2.Bundle, tr root.TrustedMaterial) {
+	n.addChild("Bundle Media Type", b.MediaType)
+
+	if b.VerificationMaterial != nil {
+		populateV2VerificationMaterialSummary(n, b.VerificationMaterial, tr)
+	} else {
+		n.addChild("[!] WARNING", "Missing Verification Material")
+	}
+
+	populateV2ContentSummary(n, b.Payload)
+}
+
+func populateV2VerificationMaterialSummary(n *node, vm *bundleV2.VerificationMaterial, tr root.TrustedMaterial) {
+	vmNode := n.addChild("Verification Material", "")
+
+	switch content := vm.Content.(type) {
+	case *bundleV2.VerificationMaterial_TransparencyLogProof:
+		tlogNode := vmNode.addChild("Content", "Transparency Log Proof")
+		if content.TransparencyLogProof == nil {
+			tlogNode.addChild("[!] WARNING", "Transparency log proof is empty")
+			return
+		}
+		populateV2TlogProofSummary(tlogNode, content.TransparencyLogProof)
+
+	case *bundleV2.VerificationMaterial_PublicKey:
+		pkNode := vmNode.addChild("Content", "Public Key")
+		if content.PublicKey == nil {
+			pkNode.addChild("[!] WARNING", "Public key material is empty")
+			return
+		}
+		populateV2SignatureSummary(pkNode, content.PublicKey.GetSignature(), true)
+		if tsData := content.PublicKey.GetTimestamps(); tsData != nil {
+			tsNode := pkNode.addChild("Timestamp Verification Data", "")
+			populateRFC3161Timestamps(tsNode, tsData.GetRfc3161Timestamps())
+		}
+
+	case *bundleV2.VerificationMaterial_Certificate:
+		certContentNode := vmNode.addChild("Content", "X.509 Certificate")
+		if content.Certificate == nil {
+			certContentNode.addChild("[!] WARNING", "Certificate material is empty")
+			return
+		}
+		if cert := content.Certificate.GetCertificate(); cert != nil && len(cert.RawBytes) > 0 {
+			certNode := certContentNode.addChild("Certificate", "")
+			populateCertificateSummary(certNode, cert.RawBytes, tr)
+		} else {
+			certContentNode.addChild("[!] WARNING", "Certificate raw_bytes is empty")
+		}
+		if intermediates := content.Certificate.GetIntermediates(); intermediates != nil && len(intermediates.Certificates) > 0 {
+			interNode := certContentNode.addChild("Intermediates", fmt.Sprintf("%d", len(intermediates.Certificates)))
+			for i, ic := range intermediates.Certificates {
+				icNode := interNode.addChild(fmt.Sprintf("Certificate [%d]", i), "")
+				if ic != nil && len(ic.RawBytes) > 0 {
+					populateCertificateSummary(icNode, ic.RawBytes, tr)
+				} else {
+					icNode.addChild("[!] WARNING", "Certificate raw_bytes is empty")
+				}
+			}
+		}
+		populateV2SignatureSummary(certContentNode, content.Certificate.GetSignature(), true)
+		if tsData := content.Certificate.GetTimestamps(); tsData != nil && len(tsData.GetRfc3161Timestamps()) > 0 {
+			tsNode := certContentNode.addChild("Timestamp Verification Data", "")
+			populateRFC3161Timestamps(tsNode, tsData.GetRfc3161Timestamps())
+		} else {
+			certContentNode.addChild("[!] WARNING", "Missing RFC3161 timestamps")
+		}
+
+	case nil:
+		vmNode.addChild("[!] WARNING", "Missing Verification Material Content (must be transparency log proof, public key, or certificate)")
+	}
+}
+
+func populateV2TlogProofSummary(n *node, tlp *bundleV2.TransparencyLogProof) {
+	if len(tlp.Proof) == 0 {
+		n.addChild("[!] WARNING", "Proof is empty")
+	} else {
+		var tlogProof proof.TLogProof
+		if err := tlogProof.Unmarshal(tlp.Proof); err != nil {
+			n.addChild("[!] WARNING", fmt.Sprintf("Failed to parse tlog proof: %v", err))
+			n.addChild("Proof", fmt.Sprintf("Present (%d bytes)", len(tlp.Proof)))
+		} else {
+			n.addChild("Log Index", fmt.Sprintf("%d", tlogProof.Index))
+			n.addChild("Inclusion Proof Hashes", fmt.Sprintf("%d", len(tlogProof.Hashes)))
+			if len(tlogProof.Checkpoint) > 0 {
+				checkpointNode := n.addChild("Checkpoint", "")
+				populateSignedCheckpointSummary(checkpointNode, tlogProof.Checkpoint)
+			} else {
+				n.addChild("[!] WARNING", "Missing checkpoint in tlog proof")
+			}
+			if len(tlogProof.ExtraData) > 0 {
+				populateV2ExtraDataSummary(n, tlogProof.ExtraData)
+			}
+		}
+	}
+
+	if tlp.Signature != nil {
+		populateV2SignatureSummary(n, tlp.Signature, false)
+	}
+}
+
+func populateV2ExtraDataSummary(n *node, extraData []byte) {
+	if len(extraData) > maxV2ExtraDataBytes {
+		n.addChild("[!] WARNING", "Extra data exceeds 64 KiB")
+		n.addChild("Extra Data", fmt.Sprintf("Present (%d bytes)", len(extraData)))
+		return
+	}
+	var extraNode *node
+	seen := make(map[string]struct{})
+	claims := 0
+	for line := range strings.SplitSeq(string(extraData), "\n") {
+		if line == "" {
+			continue
+		}
+		if extraNode == nil {
+			extraNode = n.addChild("Extra Claims", "")
+		}
+		if claims >= maxV2ExtraDataClaims {
+			extraNode.addChild("[!] WARNING", "Extra data exceeds 64 claims")
+			break
+		}
+		claims++
+		key, val, ok := strings.Cut(line, ":")
+		if !ok || key == "" {
+			extraNode.addChild("[!] WARNING", "Malformed extra data entry")
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			extraNode.addChild("[!] WARNING", fmt.Sprintf("Duplicate extra claim key: %s", key))
+			continue
+		}
+		seen[key] = struct{}{}
+		extraNode.addChild(key, val)
+	}
+}
+
+func populateV2SignatureSummary(n *node, sig *bundleV2.Signature, required bool) {
+	if sig == nil {
+		if required {
+			n.addChild("[!] WARNING", "Missing Signature")
+		}
+		return
+	}
+	if len(sig.Signature) == 0 {
+		n.addChild("[!] WARNING", "Signature is empty")
+		return
+	}
+	n.addChild("Signature", fmt.Sprintf("Present (%d bytes)", len(sig.Signature)))
+}
+
+func populateV2ContentSummary(n *node, payload *bundleV2.Payload) {
+	contentNode := n.addChild("Content", "")
+	if payload == nil {
+		contentNode.addChild("Type", "Detached Artifact")
+		return
+	}
+	contentNode.addChild("Type", "Embedded Payload")
+	if payload.PayloadType != "" {
+		contentNode.addChild("Payload Type", payload.PayloadType)
+	} else {
+		contentNode.addChild("[!] WARNING", "Missing Payload Type")
+	}
+	if len(payload.Payload) > 0 {
+		contentNode.addChild("Payload", fmt.Sprintf("Present (%d bytes)", len(payload.Payload)))
+		populateInTotoPayloadSummary(contentNode, payload.PayloadType, payload.Payload)
+	} else {
+		contentNode.addChild("[!] WARNING", "Payload is empty")
 	}
 }
 

@@ -17,9 +17,11 @@ package trustedroot
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
@@ -407,5 +409,75 @@ func makeKey(t *testing.T, path string) {
 func checkErr(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCreateCmdMLDSARekorKey(t *testing.T) {
+	ctx := context.Background()
+	td := t.TempDir()
+
+	priv, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	checkErr(t, err)
+	pub := priv.PublicKey()
+
+	if got := getSignatureHashAlgo(pub); got != crypto.Hash(0) {
+		t.Fatalf("getSignatureHashAlgo(*mldsa.PublicKey) = %v, want crypto.Hash(0)", got)
+	}
+
+	derBytes, err := x509.MarshalPKIXPublicKey(pub)
+	checkErr(t, err)
+	rekorV3KeyPath := filepath.Join(td, "rekor.v3.pub")
+	checkErr(t, os.WriteFile(rekorV3KeyPath, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: derBytes}), 0o600))
+
+	outPath := filepath.Join(td, "trustedroot.json")
+	cmd := CreateCmd{
+		RekorSpecs: []string{
+			fmt.Sprintf("url=https://rekor-v3.sigstore.example,public-key=%s,start-time=2026-01-01T00:00:00Z,origin=rekor-v3.sigstore.example", rekorV3KeyPath),
+		},
+		Out: outPath,
+	}
+	checkErr(t, cmd.Exec(ctx))
+
+	raw, err := os.ReadFile(outPath)
+	checkErr(t, err)
+	if !strings.Contains(string(raw), "ML_DSA_44") {
+		t.Fatalf("expected trusted root JSON to contain ML_DSA_44 key details, got: %s", string(raw))
+	}
+
+	tr, err := root.NewTrustedRootFromPath(outPath)
+	checkErr(t, err)
+	tlogs := tr.RekorLogs()
+	if len(tlogs) != 1 {
+		t.Fatalf("expected 1 Rekor log, got %d", len(tlogs))
+	}
+	for _, tlog := range tlogs {
+		if tlog.BaseURL != "https://rekor-v3.sigstore.example" {
+			t.Errorf("BaseURL = %q, want %q", tlog.BaseURL, "https://rekor-v3.sigstore.example")
+		}
+		if tlog.SignatureHashFunc != crypto.Hash(0) {
+			t.Errorf("SignatureHashFunc = %v, want crypto.Hash(0)", tlog.SignatureHashFunc)
+		}
+		gotPub, ok := tlog.PublicKey.(*mldsa.PublicKey)
+		if !ok {
+			t.Fatalf("PublicKey type = %T, want *mldsa.PublicKey", tlog.PublicKey)
+		}
+		if !gotPub.Equal(pub) {
+			t.Error("round-tripped ML-DSA public key does not match original")
+		}
+	}
+
+	// Non-ML-DSA-44 parameters must fail closed.
+	priv65, err := mldsa.GenerateKey(mldsa.MLDSA65())
+	checkErr(t, err)
+	der65, err := x509.MarshalPKIXPublicKey(priv65.PublicKey())
+	checkErr(t, err)
+	key65Path := filepath.Join(td, "rekor.mldsa65.pub")
+	checkErr(t, os.WriteFile(key65Path, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der65}), 0o600))
+	cmd65 := CreateCmd{
+		RekorSpecs: []string{fmt.Sprintf("url=https://rekor-v3.sigstore.example,public-key=%s,start-time=2026-01-01T00:00:00Z,origin=rekor-v3.sigstore.example", key65Path)},
+		Out:        filepath.Join(td, "trustedroot-65.json"),
+	}
+	if err := cmd65.Exec(ctx); err == nil {
+		t.Fatal("expected error for unsupported ML-DSA-65 Rekor key, got nil")
 	}
 }

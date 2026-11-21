@@ -134,7 +134,7 @@ func CleanCmd(ctx context.Context, regOpts options.RegistryOptions, cleanType op
 					return err
 				}
 				if layerManifest != nil {
-					if layerManifest.Config.ArtifactType == bundle.BundleV03MediaType {
+					if isSigstoreBundleArtifactType(layerManifest.ArtifactType) || isSigstoreBundleArtifactType(layerManifest.Config.ArtifactType) {
 						referrerRefs = append(referrerRefs, layerDigest)
 					}
 				}
@@ -219,4 +219,8 @@ func prompt(cleanType options.CleanType) string {
 		return "this will remove all signatures, SBOMs and attestations from the image"
 	}
 	panic("invalid CleanType value")
+}
+
+func isSigstoreBundleArtifactType(at string) bool {
+	return at == bundle.BundleV03MediaType || at == bundle.BundleV20MediaType
 }

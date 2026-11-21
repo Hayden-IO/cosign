@@ -35,8 +35,8 @@ func SignatureCmd(ctx context.Context, regOpts options.RegistryOptions, imageRef
 		return err
 	}
 
-	// Try bundles first
-	newBundles, _, err := cosign.GetBundles(ctx, ref, ociremoteOpts, regOpts.NameOptions()...)
+	// Try bundles first (both v1 and v2)
+	newBundles, _, err := cosign.GetAllBundles(ctx, ref, ociremoteOpts, regOpts.NameOptions()...)
 	if err == nil && len(newBundles) > 0 {
 		for _, eachBundle := range newBundles {
 			b, err := json.Marshal(eachBundle)

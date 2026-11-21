@@ -982,3 +982,131 @@ func TestWriteSignedImageIndexImages_BundleUploadOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteSignedImageIndexImages_PreservesBundleV2MediaType(t *testing.T) {
+	subjectDigest := v1.Hash{Algorithm: "sha256", Hex: "ef637aabc052029acfd192d8ed6674a5249a8783e551c08db71e321ca11b421d"}
+	v2Bytes := []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle.v2.0+json"}`)
+	layerDigest, err := static.NewLayer(v2Bytes, types.MediaType(bundle.BundleV20MediaType)).Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name            string
+		manifestArtType string
+		layerMediaType  types.MediaType
+		layerDigest     v1.Hash
+		symlinkEscape   bool
+		wantErr         bool
+	}{
+		{"explicit v2 artifactType and layer mediaType", bundle.BundleV20MediaType, types.MediaType(bundle.BundleV20MediaType), layerDigest, false, false},
+		{"fallback detection from v2 bundle JSON when omitted", "", "", layerDigest, false, false},
+		{"rejects unsupported layer digest algorithm", bundle.BundleV20MediaType, types.MediaType(bundle.BundleV20MediaType), v1.Hash{Algorithm: "sha512", Hex: strings.Repeat("a", 128)}, false, true},
+		{"rejects symlink escaping blobs dir", bundle.BundleV20MediaType, types.MediaType(bundle.BundleV20MediaType), layerDigest, true, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			origWriteLayer, origPut := remoteWriteLayer, remotePut
+			t.Cleanup(func() { remoteWriteLayer, remotePut = origWriteLayer, origPut })
+
+			manifest := &v1.Manifest{
+				SchemaVersion: 2,
+				MediaType:     types.OCIManifestSchema1,
+				ArtifactType:  tc.manifestArtType,
+				Config: v1.Descriptor{
+					MediaType: types.MediaType("application/vnd.oci.empty.v1+json"),
+					Digest:    v1.Hash{Algorithm: "sha256", Hex: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"},
+					Size:      2,
+				},
+				Layers:      []v1.Descriptor{{MediaType: tc.layerMediaType, Digest: tc.layerDigest, Size: int64(len(v2Bytes))}},
+				Subject:     &v1.Descriptor{Digest: subjectDigest},
+				Annotations: map[string]string{BundlePredicateType: "https://sigstore.dev/cosign/sign/v1"},
+			}
+			manifestBytes, err := json.Marshal(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifestDigest, _, err := v1.SHA256(strings.NewReader(string(manifestBytes)))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			dir := t.TempDir()
+			blobDir := filepath.Join(dir, "blobs", "sha256")
+			if err := os.MkdirAll(blobDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.symlinkEscape {
+				outside := filepath.Join(t.TempDir(), "secret")
+				if err := os.WriteFile(outside, v2Bytes, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, filepath.Join(blobDir, layerDigest.Hex)); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(filepath.Join(blobDir, layerDigest.Hex), v2Bytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("COSIGN_MAX_ATTACHMENT_SIZE", "4096")
+			if err := os.Mkdir(filepath.Join(blobDir, "subdir"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(blobDir, strings.Repeat("f", 64)), make([]byte, 5000), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(blobDir, manifestDigest.Hex), manifestBytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			var uploadedLayers []v1.Layer
+			var uploadedManifest remote.Taggable
+			remoteWriteLayer = func(_ name.Repository, l v1.Layer, _ ...remote.Option) error {
+				uploadedLayers = append(uploadedLayers, l)
+				return nil
+			}
+			remotePut = func(_ name.Reference, m remote.Taggable, _ ...remote.Option) error {
+				uploadedManifest = m
+				return nil
+			}
+
+			ref, err := name.NewDigest("gcr.io/test/image@" + subjectDigest.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = WriteSignedImageIndexImages(ref, stubSignedImageIndex{}, dir)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("WriteSignedImageIndexImages() = %v", err)
+			}
+			if len(uploadedLayers) != 2 {
+				t.Fatalf("uploaded %d layers, want 2", len(uploadedLayers))
+			}
+			if gotMT, err := uploadedLayers[1].MediaType(); err != nil || string(gotMT) != bundle.BundleV20MediaType {
+				t.Errorf("uploaded bundle layer MediaType = %q (err=%v), want %q", gotMT, err, bundle.BundleV20MediaType)
+			}
+			rawManifest, err := uploadedManifest.RawManifest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parsed struct {
+				ArtifactType string          `json:"artifactType"`
+				Layers       []v1.Descriptor `json:"layers"`
+			}
+			if err := json.Unmarshal(rawManifest, &parsed); err != nil {
+				t.Fatal(err)
+			}
+			if parsed.ArtifactType != bundle.BundleV20MediaType {
+				t.Errorf("manifest ArtifactType = %q, want %q", parsed.ArtifactType, bundle.BundleV20MediaType)
+			}
+			if len(parsed.Layers) != 1 || string(parsed.Layers[0].MediaType) != bundle.BundleV20MediaType {
+				t.Errorf("manifest Layers = %v, want MediaType %q", parsed.Layers, bundle.BundleV20MediaType)
+			}
+		})
+	}
+}

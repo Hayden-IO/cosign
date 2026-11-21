@@ -29,6 +29,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/sigstore/cosign/v3/internal/ui"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 )
 
 type UpgradeCmd struct {
@@ -66,6 +67,9 @@ func (c *UpgradeCmd) Exec(ctx context.Context, bundlePath string) error {
 }
 
 func upgradeBundle(ctx context.Context, data []byte, rekorClient *client.Rekor) ([]byte, error) {
+	if peekBundleMediaType(data) == cbundle.BundleV20MediaType {
+		return nil, fmt.Errorf("bundle v2 (%s) does not support v0.1/v0.2 to v0.3 upgrade", cbundle.BundleV20MediaType)
+	}
 	var bundle protobundle.Bundle
 	if err := protojson.Unmarshal(data, &bundle); err != nil {
 		return nil, fmt.Errorf("unmarshaling bundle: %w", err)

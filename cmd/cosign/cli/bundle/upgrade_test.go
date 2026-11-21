@@ -215,6 +215,11 @@ func TestUpgradeBundle(t *testing.T) {
 			expectError: true,
 		},
 		{
+			name:        "Bundle v2 rejected with clear error",
+			input:       `{"mediaType": "application/vnd.dev.sigstore.bundle.v2.0+json", "verificationMaterial": {"transparencyLogProof": {"proof": "cA=="}}}`,
+			expectError: true,
+		},
+		{
 			name: "Upgrade with missing inclusion proof",
 			input: `{
 				"mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.1",

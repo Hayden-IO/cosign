@@ -17,6 +17,8 @@ package remote
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -114,13 +116,32 @@ func WriteSignedImageIndexImages(ref name.Reference, sii oci.SignedImageIndex, d
 		return err
 	}
 
+	blobsRoot, err := os.OpenRoot(blobPath)
+	if err != nil {
+		return err
+	}
+	defer blobsRoot.Close()
+
 	for _, file := range files {
-		fd, err := os.Open(filepath.Join(blobPath, file.Name()))
+		if file.IsDir() {
+			continue
+		}
+		fd, err := blobsRoot.Open(file.Name())
 		if err != nil {
 			return err
 		}
-		manifest, err := v1.ParseManifest(fd)
+		fi, err := fd.Stat()
+		if err != nil || !fi.Mode().IsRegular() {
+			fd.Close()
+			continue
+		}
+		manifestBytes, err := readCapped(fd)
 		fd.Close()
+		if err != nil {
+			// Skip oversized non-manifest blobs (e.g., container image layers).
+			continue
+		}
+		manifest, err := v1.ParseManifest(bytes.NewReader(manifestBytes))
 		if err != nil || manifest.Subject == nil {
 			continue
 		}
@@ -140,20 +161,63 @@ func WriteSignedImageIndexImages(ref name.Reference, sii oci.SignedImageIndex, d
 				}
 
 				// Write bundle layers before the manifest (registries require blobs first)
-				for _, layer := range manifest.Layers {
-					bundlePath := filepath.Join(directory, "blobs", "sha256", layer.Digest.Hex)
-					bundleBytes, err := os.ReadFile(bundlePath)
+				var firstLayerMediaType types.MediaType
+				for i, layerDesc := range manifest.Layers {
+					if layerDesc.Digest.Algorithm != "sha256" || len(layerDesc.Digest.Hex) != 64 || strings.ToLower(layerDesc.Digest.Hex) != layerDesc.Digest.Hex {
+						return fmt.Errorf("invalid layer digest %q", layerDesc.Digest.String())
+					}
+					if _, err := hex.DecodeString(layerDesc.Digest.Hex); err != nil {
+						return fmt.Errorf("invalid layer digest %q: %w", layerDesc.Digest.String(), err)
+					}
+					bf, err := blobsRoot.Open(layerDesc.Digest.Hex)
 					if err != nil {
 						return err
 					}
-					layer := static.NewLayer(bundleBytes, types.MediaType(bundle.BundleV03MediaType))
+					bfi, err := bf.Stat()
+					if err != nil || !bfi.Mode().IsRegular() {
+						bf.Close()
+						return fmt.Errorf("layer blob %q is not a regular file", layerDesc.Digest.Hex)
+					}
+					bundleBytes, err := readCapped(bf)
+					bf.Close()
+					if err != nil {
+						return err
+					}
+					sum := sha256.Sum256(bundleBytes)
+					if hex.EncodeToString(sum[:]) != layerDesc.Digest.Hex {
+						return fmt.Errorf("layer blob digest mismatch for %q", layerDesc.Digest.String())
+					}
+					layerMediaType := layerDesc.MediaType
+					if layerMediaType == "" {
+						detected, err := detectBundleMediaType(bundleBytes)
+						if err != nil {
+							return fmt.Errorf("failed to determine bundle media type: %w", err)
+						}
+						layerMediaType = types.MediaType(detected)
+						manifest.Layers[i].MediaType = layerMediaType
+					}
+					if firstLayerMediaType == "" {
+						firstLayerMediaType = layerMediaType
+					}
+					layer := static.NewLayer(bundleBytes, layerMediaType)
 					if err := remoteWriteLayer(o.TargetRepository, layer, o.ROpt...); err != nil {
 						return err
 					}
 				}
 
+				artifactType := manifest.ArtifactType
+				if artifactType == "" {
+					artifactType = manifest.Config.ArtifactType
+				}
+				if artifactType == "" && firstLayerMediaType != "" {
+					artifactType = string(firstLayerMediaType)
+				}
+				if artifactType == "" {
+					artifactType = bundle.BundleV03MediaType
+				}
+
 				// Write the manifest
-				m := referrerManifest{*manifest, bundle.BundleV03MediaType}
+				m := referrerManifest{*manifest, artifactType}
 				targetRef, err := m.targetRef(o.TargetRepository, opts...)
 				if err != nil {
 					return fmt.Errorf("failed to create target reference: %w", err)

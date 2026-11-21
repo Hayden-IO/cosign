@@ -26,8 +26,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -38,11 +40,14 @@ import (
 
 	"github.com/digitorus/timestamp"
 	"github.com/sigstore/cosign/v3/internal/test"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
+	bundleV2 "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v2"
 	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	protodsse "github.com/sigstore/protobuf-specs/gen/pb-go/dsse"
 	rekorv1 "github.com/sigstore/protobuf-specs/gen/pb-go/rekor/v1"
 	"github.com/sigstore/sigstore-go/pkg/root"
+	"github.com/transparency-dev/formats/proof"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -948,4 +953,161 @@ func generateTestTimestampResponse(t *testing.T) []byte {
 	}
 
 	return tsResponse
+}
+
+func TestInspectV2Bundles(t *testing.T) {
+	checkpoint := []byte("rekor-v3.sigstore.example\n100\n47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\n\n— rekor-v3.sigstore.example dGVzdC1zaWc=\n")
+	hashEntry := sha256.Sum256([]byte("leaf-hash"))
+
+	oidcProof := proof.TLogProof{
+		Index: 42, Hashes: [][sha256.Size]byte{hashEntry}, Checkpoint: checkpoint,
+		ExtraData: []byte("issuer:https://accounts.google.com\nidentity:alice@example.com\n"),
+	}.Marshal()
+	keyProof := proof.TLogProof{
+		Index: 7, Hashes: [][sha256.Size]byte{hashEntry}, Checkpoint: checkpoint,
+		ExtraData: []byte("context:deadbeef"),
+	}.Marshal()
+
+	mldsaPriv, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mldsaCertTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "mldsa-signer"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+	}
+	mldsaCertDER, err := x509.CreateCertificate(rand.Reader, mldsaCertTmpl, mldsaCertTmpl, mldsaPriv.PublicKey(), mldsaPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tsResp := generateTestTimestampResponse(t)
+	tsData := &bundleV2.TimestampVerificationData{Rfc3161Timestamps: []*protocommon.RFC3161SignedTimestamp{{SignedTimestamp: tsResp}}}
+	inTotoPayload := []byte(`{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"ghcr.io/example/app"}],"predicateType":"https://slsa.dev/provenance/v1"}`)
+
+	mkV2 := func(vm *bundleV2.VerificationMaterial, p *bundleV2.Payload) *bundleV2.Bundle {
+		return &bundleV2.Bundle{MediaType: cbundle.BundleV20MediaType, VerificationMaterial: vm, Payload: p}
+	}
+	tlogVM := func(p []byte, sig *bundleV2.Signature) *bundleV2.VerificationMaterial {
+		return &bundleV2.VerificationMaterial{Content: &bundleV2.VerificationMaterial_TransparencyLogProof{TransparencyLogProof: &bundleV2.TransparencyLogProof{Proof: p, Signature: sig}}}
+	}
+
+	tests := []struct {
+		name         string
+		rawJSON      []byte
+		bundle       *bundleV2.Bundle
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:   "OIDC transparent v2 bundle with detached artifact",
+			bundle: mkV2(tlogVM(oidcProof, nil), nil),
+			wantContains: []string{
+				"Bundle Media Type: " + cbundle.BundleV20MediaType, "Content: Transparency Log Proof",
+				"Log Index: 42", "Inclusion Proof Hashes: 1", "Origin: rekor-v3.sigstore.example",
+				"issuer: https://accounts.google.com", "identity: alice@example.com", "Type: Detached Artifact",
+			},
+			wantAbsent: []string{"[!] WARNING"},
+		},
+		{
+			name:   "Managed key transparent v2 bundle with in-toto payload",
+			bundle: mkV2(tlogVM(keyProof, &bundleV2.Signature{Signature: make([]byte, 2420)}), &bundleV2.Payload{PayloadType: "application/vnd.in-toto+json", Payload: inTotoPayload}),
+			wantContains: []string{
+				"Log Index: 7", "context: deadbeef", "Signature: Present (2420 bytes)",
+				"Type: Embedded Payload", "Payload Type: application/vnd.in-toto+json",
+				"Predicate Type: https://slsa.dev/provenance/v1", "Name: ghcr.io/example/app",
+			},
+			wantAbsent: []string{"[!] WARNING"},
+		},
+		{
+			name: "v2 PublicKey bundle with RFC3161 timestamp",
+			bundle: mkV2(&bundleV2.VerificationMaterial{Content: &bundleV2.VerificationMaterial_PublicKey{
+				PublicKey: &bundleV2.PublicKey{Signature: &bundleV2.Signature{Signature: []byte("mldsa-sig")}, Timestamps: tsData},
+			}}, nil),
+			wantContains: []string{"Content: Public Key", "Signature: Present (9 bytes)", "RFC3161 Timestamps: 1"},
+			wantAbsent:   []string{"[!] WARNING"},
+		},
+		{
+			name: "v2 Certificate bundle with ML-DSA-44 certificate",
+			bundle: mkV2(&bundleV2.VerificationMaterial{Content: &bundleV2.VerificationMaterial_Certificate{
+				Certificate: &bundleV2.Certificate{
+					Certificate: &protocommon.X509Certificate{RawBytes: mldsaCertDER},
+					Signature:   &bundleV2.Signature{Signature: []byte("bundle-sig")},
+					Timestamps:  tsData,
+				},
+			}}, nil),
+			wantContains: []string{"Content: X.509 Certificate", "Algorithm: ML-DSA", "Parameters: ML-DSA-44", "Signature: Present (10 bytes)", "RFC3161 Timestamps: 1"},
+			wantAbsent:   []string{"[!] WARNING"},
+		},
+		{
+			name: "v2 Certificate missing timestamps and ANSI payloadType sanitized",
+			bundle: mkV2(&bundleV2.VerificationMaterial{Content: &bundleV2.VerificationMaterial_Certificate{
+				Certificate: &bundleV2.Certificate{Certificate: &protocommon.X509Certificate{RawBytes: mldsaCertDER}, Signature: &bundleV2.Signature{Signature: []byte("sig")}},
+			}}, &bundleV2.Payload{PayloadType: "text/plain\x1b[31m\nfake", Payload: []byte("hi")}),
+			wantContains: []string{"Missing RFC3161 timestamps", `text/plain\x1b[31m\x0afake`},
+			wantAbsent:   []string{"\x1b[31m"},
+		},
+		{
+			name:         "v2 duplicate and malformed extra claims with control chars",
+			bundle:       mkV2(tlogVM(proof.TLogProof{Index: 1, Checkpoint: checkpoint, ExtraData: []byte("\nissuer:a\x1b[2J\nissuer:b\nmalformed\n")}.Marshal(), nil), nil),
+			wantContains: []string{`issuer: a\x1b[2J`, "Duplicate extra claim key: issuer", "Malformed extra data entry"},
+			wantAbsent:   []string{"\x1b[2J"},
+		},
+		{
+			name:         "snake_case media_type with missing verification material",
+			rawJSON:      []byte(`{"media_type":"` + cbundle.BundleV20MediaType + `"}`),
+			wantContains: []string{"Bundle Media Type: " + cbundle.BundleV20MediaType, "Missing Verification Material", "Type: Detached Artifact"},
+		},
+		{
+			name:         "v2 tlog proof parse error and empty signature warnings",
+			bundle:       mkV2(tlogVM([]byte("bad-proof"), &bundleV2.Signature{}), nil),
+			wantContains: []string{"Failed to parse tlog proof", "Signature is empty"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := tc.rawJSON
+			if data == nil {
+				var err error
+				if data, err = protojson.Marshal(tc.bundle); err != nil {
+					t.Fatal(err)
+				}
+			}
+			bundlePath := filepath.Join(t.TempDir(), "bundle.json")
+			if err := os.WriteFile(bundlePath, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			var out bytes.Buffer
+			if err := (&InspectCmd{BundlePath: bundlePath, Out: &out}).Exec(); err != nil {
+				t.Fatalf("InspectCmd.Exec() = %v", err)
+			}
+			got := out.String()
+			for _, want := range tc.wantContains {
+				if !strings.Contains(got, want) {
+					t.Errorf("output missing %q;\ngot:\n%s", want, got)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("output unexpectedly contained %q;\ngot:\n%s", absent, got)
+				}
+			}
+		})
+	}
+}
+
+func TestInspectCmdPathAndSizeGuards(t *testing.T) {
+	if err := (&InspectCmd{}).Exec(); err == nil {
+		t.Fatal("expected error for empty BundlePath")
+	}
+	t.Setenv("COSIGN_MAX_ATTACHMENT_SIZE", "16")
+	p := filepath.Join(t.TempDir(), "oversized.json")
+	if err := os.WriteFile(p, []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle.v2.0+json"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&InspectCmd{BundlePath: p, Out: &bytes.Buffer{}}).Exec(); err == nil {
+		t.Fatal("expected error for oversized bundle file")
+	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/sigstore/cosign/v3/pkg/cosign"
 	"github.com/sigstore/cosign/v3/pkg/oci/platform"
 	ociremote "github.com/sigstore/cosign/v3/pkg/oci/remote"
+	"github.com/sigstore/sigstore-go/pkg/verify"
 )
 
 func AttestationCmd(ctx context.Context, regOpts options.RegistryOptions, attOptions options.AttestationDownloadOptions, imageRef string, out io.Writer) error {
@@ -49,20 +50,28 @@ func AttestationCmd(ctx context.Context, regOpts options.RegistryOptions, attOpt
 
 	var foundMatches bool
 
-	// Try bundles first
-	newBundles, _, err := cosign.GetBundles(ctx, ref, ociremoteOpts, regOpts.NameOptions()...)
+	// Try bundles first (both v1 and v2)
+	newBundles, _, err := cosign.GetAllBundles(ctx, ref, ociremoteOpts, regOpts.NameOptions()...)
 	if err == nil && len(newBundles) > 0 {
 		for _, eachBundle := range newBundles {
+			var (
+				envelope verify.EnvelopeContent
+				envErr   error
+			)
+			switch {
+			case eachBundle.IsV1():
+				envelope, envErr = eachBundle.V1.Envelope()
+			case eachBundle.IsV2():
+				envelope, envErr = eachBundle.V2.Envelope()
+			default:
+				continue
+			}
+			if envErr != nil || envelope == nil {
+				continue
+			}
 			if predicateType != "" {
-				envelope, err := eachBundle.Envelope()
-				if err != nil || envelope == nil {
-					continue
-				}
 				statement, err := envelope.Statement()
-				if err != nil || statement == nil {
-					continue
-				}
-				if statement.PredicateType != predicateType {
+				if err != nil || statement == nil || statement.PredicateType != predicateType {
 					continue
 				}
 			}

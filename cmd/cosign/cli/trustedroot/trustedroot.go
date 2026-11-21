@@ -21,6 +21,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/mldsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/hex"
@@ -201,7 +202,7 @@ func (c *CreateCmd) Exec(_ context.Context) error {
 			if err != nil {
 				return fmt.Errorf("parsing rekor spec: %w", err)
 			}
-			// Rekor v2 needs origin for checkpoint ID
+			// Rekor v2/v3 need origin for checkpoint ID
 			kvs, _ := parseKVs(spec)
 			if origin, ok := kvs["origin"]; ok {
 				id, rekorLog.ID, err = getCheckpointID(origin, rekorLog.PublicKey)
@@ -595,6 +596,8 @@ func getSignatureHashAlgo(pubKey crypto.PublicKey) crypto.Hash {
 		}
 	case ed25519.PublicKey:
 		h = crypto.SHA512
+	case *mldsa.PublicKey:
+		h = crypto.Hash(0)
 	default:
 		h = crypto.SHA256
 	}
