@@ -19,16 +19,18 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
+	"github.com/secure-systems-lab/go-securesystemslib/dsse"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/options"
 	"github.com/sigstore/cosign/v3/internal/ui"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	"github.com/sigstore/cosign/v3/pkg/oci/static"
 	"github.com/sigstore/cosign/v3/pkg/policy"
-	sgbundle "github.com/sigstore/sigstore-go/pkg/bundle"
 	sgverify "github.com/sigstore/sigstore-go/pkg/verify"
 )
 
@@ -59,6 +61,7 @@ type VerifyBlobAttestationCommand struct {
 	DigestAlg string
 
 	AllowCertificateChain bool
+	PQCOnly               bool
 }
 
 // Exec runs the verification command
@@ -71,6 +74,13 @@ func (c *VerifyBlobAttestationCommand) Exec(ctx context.Context, artifactPath st
 	// We can't have both a key and a security key
 	if options.NOf(c.KeyRef, c.Sk) > 1 {
 		return &options.KeyParseError{}
+	}
+
+	if c.PQCOnly {
+		if err := ValidatePQCOnlyFlags(c.IgnoreTlog, c.Sk, c.UseSignedTimestamps); err != nil {
+			return err
+		}
+		WarnExperimentalPQCOnly(ctx)
 	}
 
 	var identities []cosign.Identity
@@ -92,11 +102,12 @@ func (c *VerifyBlobAttestationCommand) Exec(ctx context.Context, artifactPath st
 		IgnoreTlog:                   c.IgnoreTlog,
 		UseSignedTimestamps:          c.UseSignedTimestamps,
 		AllowCertificateChain:        c.AllowCertificateChain,
+		PQCOnly:                      c.PQCOnly,
 	}
 	vOfflineKey := verifyOfflineWithKey(c.KeyRef, c.Sk, co)
 
 	// User provides a key. Otherwise, verification requires a Fulcio certificate
-	// provided in an attached bundle.
+	// or OIDC transparency log identity provided in an attached bundle.
 	var closeSV func()
 	co.SigVerifier, closeSV, err = LoadVerifierFromKey(ctx, c.KeyRef, c.Slot, c.Sk)
 	if err != nil {
@@ -104,23 +115,36 @@ func (c *VerifyBlobAttestationCommand) Exec(ctx context.Context, artifactPath st
 	}
 	defer closeSV()
 
+	if c.PQCOnly {
+		if err := ValidatePQCOnlyVerifier(co.SigVerifier); err != nil {
+			return err
+		}
+	}
+
 	var digestAlg string
 	var digest []byte
 	if c.CheckClaims {
-		if artifactPath != "" {
+		switch {
+		case artifactPath != "":
 			if c.Digest != "" {
 				ui.Warnf(ctx, "Ignoring provided --digest in favor of provided blob")
 			}
 			if c.DigestAlg != "" {
 				ui.Warnf(ctx, "Ignoring provided --digestAlg because a blob was provided")
 			}
-		} else if c.Digest != "" && c.DigestAlg != "" {
+		case c.Digest != "" && c.DigestAlg != "":
 			digest, err = hex.DecodeString(c.Digest)
 			if err != nil {
 				return fmt.Errorf("unable to decode provided digest: %w", err)
 			}
 			digestAlg = c.DigestAlg
+		default:
+			return errors.New("must provide path to blob or digest and digestAlg")
 		}
+	}
+
+	if c.BundlePath == "" {
+		return errors.New("bundle path is required")
 	}
 
 	err = SetTrustedMaterial(c.TrustedRootPath, vOfflineKey, co)
@@ -131,7 +155,7 @@ func (c *VerifyBlobAttestationCommand) Exec(ctx context.Context, artifactPath st
 		return fmt.Errorf("a trusted root is required for verification; provide one via --trusted-root")
 	}
 
-	bundle, err := sgbundle.LoadJSONFromPath(c.BundlePath, co.BundleOptions()...)
+	loaded, err := cbundle.LoadBundleFromPath(c.BundlePath, co.BundleOptions()...)
 	if err != nil {
 		return err
 	}
@@ -154,27 +178,46 @@ func (c *VerifyBlobAttestationCommand) Exec(ctx context.Context, artifactPath st
 		policyOpt = sgverify.WithArtifactDigest(digestAlg, digest)
 	}
 
-	_, err = cosign.VerifyNewBundle(ctx, co, policyOpt, bundle)
-	if err != nil {
-		return err
+	var rawEnv *dsse.Envelope
+	switch {
+	case loaded.IsV1():
+		if _, err := cosign.VerifyNewBundle(ctx, co, policyOpt, loaded.V1); err != nil {
+			return err
+		}
+		sigContent, err := loaded.V1.SignatureContent()
+		if err != nil {
+			return fmt.Errorf("fetching signature content: %w", err)
+		}
+		envContent := sigContent.EnvelopeContent()
+		if envContent == nil {
+			return fmt.Errorf("bundle does not contain a DSSE envelope")
+		}
+		rawEnv = envContent.RawEnvelope()
+	case loaded.IsV2():
+		if !loaded.V2.HasEnvelope() {
+			return fmt.Errorf("bundle does not contain a DSSE envelope")
+		}
+		if _, err := cosign.VerifyBundleV2(ctx, co, policyOpt, loaded.V2); err != nil {
+			return err
+		}
+		envContent, err := loaded.V2.Envelope()
+		if err != nil {
+			return fmt.Errorf("fetching envelope from v2 bundle: %w", err)
+		}
+		rawEnv = envContent.RawEnvelope()
+	default:
+		return errors.New("empty bundle")
 	}
 
-	sigContent, err := bundle.SignatureContent()
-	if err != nil {
-		return fmt.Errorf("fetching signature content: %w", err)
-	}
-
-	envContent := sigContent.EnvelopeContent()
-	if envContent == nil {
-		return fmt.Errorf("bundle does not contain a DSSE envelope")
-	}
-
-	rawEnv := envContent.RawEnvelope()
 	if rawEnv == nil {
 		return fmt.Errorf("bundle does not contain a raw DSSE envelope")
 	}
+	envCopy := *rawEnv
+	if envCopy.Signatures == nil {
+		envCopy.Signatures = []dsse.Signature{}
+	}
 
-	payloadBytes, err := json.Marshal(rawEnv)
+	payloadBytes, err := json.Marshal(&envCopy)
 	if err != nil {
 		return fmt.Errorf("marshaling envelope: %w", err)
 	}

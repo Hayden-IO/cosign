@@ -23,6 +23,10 @@ import (
 	"github.com/sigstore/cosign/v3/internal/pkg/cosign"
 )
 
+// ExperimentalPQCOnlyFlagUsage describes the --experimental-pqc-only CLI flag.
+const ExperimentalPQCOnlyFlagUsage = "EXPERIMENTAL: accept only Sigstore v2 bundles signed with post-quantum (ML-DSA) algorithms and reject v1 bundles. " +
+	"WARNING: experimental feature subject to breaking changes without notice."
+
 type CommonVerifyOptions struct {
 	IgnoreTlog            bool
 	PrivateInfrastructure bool
@@ -32,6 +36,7 @@ type CommonVerifyOptions struct {
 	UseSignedTimestamps   bool
 	TrustedRootPath       string
 	AllowCertificateChain bool
+	ExperimentalPQCOnly   bool
 }
 
 func (o *CommonVerifyOptions) AddFlags(cmd *cobra.Command) {
@@ -56,6 +61,9 @@ func (o *CommonVerifyOptions) AddFlags(cmd *cobra.Command) {
 
 	cmd.Flags().BoolVar(&o.AllowCertificateChain, "allow-certificate-chain", false,
 		"allow X.509 certificate chains in bundle verification material for v0.3+ bundles")
+
+	cmd.Flags().BoolVar(&o.ExperimentalPQCOnly, "experimental-pqc-only", false,
+		ExperimentalPQCOnlyFlagUsage)
 }
 
 var verifyOutputTypes = []string{"json", "text"} // First one is the default

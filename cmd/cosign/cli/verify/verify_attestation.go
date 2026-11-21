@@ -77,6 +77,17 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 		return &options.KeyParseError{}
 	}
 
+	if c.ExperimentalPQCOnly {
+		if err := ValidatePQCOnlyFlags(
+			c.IgnoreTlog || c.CommonVerifyOptions.IgnoreTlog || c.PrivateInfrastructure,
+			c.Sk,
+			c.UseSignedTimestamps || c.CommonVerifyOptions.UseSignedTimestamps,
+		); err != nil {
+			return err
+		}
+		WarnExperimentalPQCOnly(ctx)
+	}
+
 	var identities []cosign.Identity
 	if c.KeyRef == "" && !c.Sk {
 		identities, err = c.Identities()
@@ -109,20 +120,15 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 		MaxWorkers:                   c.MaxWorkers,
 		UseSignedTimestamps:          c.UseSignedTimestamps,
 		AllowCertificateChain:        c.AllowCertificateChain,
+		PQCOnly:                      c.ExperimentalPQCOnly,
 	}
-	vOfflineKey := verifyOfflineWithKey(c.KeyRef, c.Sk, co)
 
 	if c.CheckClaims {
 		co.ClaimVerifier = cosign.IntotoSubjectClaimVerifier
 	}
 
-	err = SetTrustedMaterial(c.TrustedRootPath, vOfflineKey, co)
-	if err != nil {
-		return fmt.Errorf("setting trusted material: %w", err)
-	}
-
 	// User provides a key. Otherwise, verification requires a Fulcio certificate
-	// provided in an attached bundle or OCI annotation.
+	// or OIDC transparency log identity provided in an attached bundle.
 	var closeSV func()
 	co.SigVerifier, closeSV, err = LoadVerifierFromKey(ctx, c.KeyRef, c.Slot, c.Sk)
 	if err != nil {
@@ -130,9 +136,21 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 	}
 	defer closeSV()
 
+	if c.ExperimentalPQCOnly {
+		if err := ValidatePQCOnlyVerifier(co.SigVerifier); err != nil {
+			return err
+		}
+	}
+
+	vOfflineKey := verifyOfflineWithKey(c.KeyRef, c.Sk, co)
+	err = SetTrustedMaterial(c.TrustedRootPath, vOfflineKey, co)
+	if err != nil {
+		return fmt.Errorf("setting trusted material: %w", err)
+	}
+
 	// NB: There are only 2 kinds of verification right now:
 	// 1. You gave us the public key explicitly to verify against so co.SigVerifier is non-nil or,
-	// 2. We're going to find an x509 certificate on the signature and verify against Fulcio root trust
+	// 2. We're going to verify an identity via a Fulcio certificate (v1) or transparency log (v2).
 	// TODO(nsmith5): Refactor this verification logic to pass back _how_ verification
 	// was performed so we don't need to use this fragile logic here.
 	fulcioVerified := (co.SigVerifier == nil)

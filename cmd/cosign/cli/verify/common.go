@@ -15,9 +15,12 @@ package verify
 
 import (
 	"context"
+	"crypto/mldsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"reflect"
 
 	"github.com/sigstore/cosign/v3/internal/ui"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
@@ -30,6 +33,61 @@ import (
 	"github.com/sigstore/sigstore/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature/payload"
 )
+
+func isNilInterface(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Slice, reflect.Map, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+// WarnExperimentalPQCOnly emits a warning banner when --experimental-pqc-only is enabled.
+func WarnExperimentalPQCOnly(ctx context.Context) {
+	ui.Warnf(ctx, "EXPERIMENTAL: --experimental-pqc-only is enabled. Only Sigstore v2 post-quantum (ML-DSA) bundles will be accepted. This feature is experimental and subject to breaking changes.")
+}
+
+// ValidatePQCOnlyFlags rejects CLI verification flags that are incompatible with --experimental-pqc-only.
+func ValidatePQCOnlyFlags(ignoreTlog, sk, useSignedTimestamps bool) error {
+	if ignoreTlog {
+		return errors.New("--insecure-ignore-tlog and --private-infrastructure cannot be used with --experimental-pqc-only")
+	}
+	if sk {
+		return errors.New("--sk cannot be used with --experimental-pqc-only")
+	}
+	if useSignedTimestamps {
+		return errors.New("--use-signed-timestamps cannot be used with --experimental-pqc-only")
+	}
+	return nil
+}
+
+// ValidatePQCOnlyVerifier rejects non-ML-DSA-44 public keys when --experimental-pqc-only is enabled.
+func ValidatePQCOnlyVerifier(sv signature.Verifier) error {
+	if isNilInterface(sv) {
+		return nil
+	}
+	pub, err := sv.PublicKey()
+	if err != nil {
+		return fmt.Errorf("getting public key from verifier: %w", err)
+	}
+	mldsaPub, ok := pub.(*mldsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("--experimental-pqc-only requires an ML-DSA-44 public key, got %T", pub)
+	}
+	params, err := cryptoutils.ValidateMLDSAPublicKey(mldsaPub)
+	if err != nil {
+		return fmt.Errorf("--experimental-pqc-only requires a valid ML-DSA-44 public key: %w", err)
+	}
+	if params != mldsa.MLDSA44() {
+		return fmt.Errorf("--experimental-pqc-only only supports ML-DSA-44 public keys (got %s): %w", params, cosign.ErrUnsupportedMLDSAParameters)
+	}
+	return nil
+}
 
 // LoadVerifierFromKey returns a signature.Verifier from the provided key flags to use for verifying an artifact.
 // In the case of certain types of keys, it returns a close function that must be called by the calling method.
@@ -103,7 +161,11 @@ func PrintVerificationHeader(ctx context.Context, imgRef string, co *cosign.Chec
 		ui.Infof(ctx, "  - The signatures were verified against the specified public key")
 	}
 	if fulcioVerified {
-		ui.Infof(ctx, "  - The code-signing certificate was verified using trusted certificate authority certificates")
+		if co.PQCOnly {
+			ui.Infof(ctx, "  - The signing identity was verified against the transparency log")
+		} else {
+			ui.Infof(ctx, "  - The code-signing certificate or signing identity was verified using trusted root material")
+		}
 	}
 }
 
@@ -233,6 +295,10 @@ func PrintVerification(ctx context.Context, verified []oci.Signature, output str
 // No trusted root is needed if verification doesn't require Rekor or
 // signed timestamps, and a key is explicitly provided instead of using
 // a Fulcio certificate either via a key or security key.
+// Transparent v2 PQC bundles always require a trusted root, so PQCOnly disables offline-key bypass.
 func verifyOfflineWithKey(keyRef string, sk bool, co *cosign.CheckOpts) bool {
+	if co == nil || co.PQCOnly {
+		return false
+	}
 	return (keyRef != "" || sk) && co.IgnoreTlog && !co.UseSignedTimestamps
 }

@@ -22,6 +22,7 @@ import (
 	"fmt"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/sigstore/cosign/v3/cmd/cosign/cli/options"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
@@ -30,6 +31,7 @@ import (
 	ociremote "github.com/sigstore/cosign/v3/pkg/oci/remote"
 	"github.com/sigstore/cosign/v3/pkg/oci/static"
 	sigs "github.com/sigstore/cosign/v3/pkg/signature"
+	"github.com/sigstore/cosign/v3/pkg/types"
 	"github.com/sigstore/protobuf-specs/gen/pb-go/dsse"
 	sgbundle "github.com/sigstore/sigstore-go/pkg/bundle"
 	"github.com/sigstore/sigstore/pkg/signature/payload"
@@ -77,6 +79,17 @@ func (c *VerifyCommand) Exec(ctx context.Context, images []string) (err error) {
 		return &options.PubKeyParseError{}
 	}
 
+	if c.ExperimentalPQCOnly {
+		if err := ValidatePQCOnlyFlags(
+			c.IgnoreTlog || c.CommonVerifyOptions.IgnoreTlog || c.PrivateInfrastructure,
+			c.Sk,
+			c.UseSignedTimestamps || c.CommonVerifyOptions.UseSignedTimestamps,
+		); err != nil {
+			return err
+		}
+		WarnExperimentalPQCOnly(ctx)
+	}
+
 	var identities []cosign.Identity
 	if c.KeyRef == "" && !c.Sk {
 		identities, err = c.Identities()
@@ -110,7 +123,24 @@ func (c *VerifyCommand) Exec(ctx context.Context, images []string) (err error) {
 		MaxWorkers:                   c.MaxWorkers,
 		UseSignedTimestamps:          c.UseSignedTimestamps,
 		AllowCertificateChain:        c.AllowCertificateChain,
+		PQCOnly:                      c.ExperimentalPQCOnly,
 	}
+
+	// User provides a key. Otherwise, verification requires a Fulcio certificate
+	// or OIDC transparency log identity provided in an attached bundle.
+	var closeSV func()
+	co.SigVerifier, closeSV, err = LoadVerifierFromKey(ctx, c.KeyRef, c.Slot, c.Sk)
+	if err != nil {
+		return fmt.Errorf("loading verifier from key opts: %w", err)
+	}
+	defer closeSV()
+
+	if c.ExperimentalPQCOnly {
+		if err := ValidatePQCOnlyVerifier(co.SigVerifier); err != nil {
+			return err
+		}
+	}
+
 	vOfflineKey := verifyOfflineWithKey(c.KeyRef, c.Sk, co)
 	err = SetTrustedMaterial(c.TrustedRootPath, vOfflineKey, co)
 	if err != nil {
@@ -118,17 +148,8 @@ func (c *VerifyCommand) Exec(ctx context.Context, images []string) (err error) {
 	}
 
 	if c.CheckClaims {
-		co.ClaimVerifier = cosign.IntotoSubjectClaimVerifier
+		co.ClaimVerifier = cosignSignClaimVerifier
 	}
-
-	// User provides a key. Otherwise, verification requires a Fulcio certificate
-	// provided in an attached bundle or OCI annotation.
-	var closeSV func()
-	co.SigVerifier, closeSV, err = LoadVerifierFromKey(ctx, c.KeyRef, c.Slot, c.Sk)
-	if err != nil {
-		return fmt.Errorf("loading verifier from key opts: %w", err)
-	}
-	defer closeSV()
 
 	fulcioVerified := (co.SigVerifier == nil)
 
@@ -165,6 +186,28 @@ func (c *VerifyCommand) Exec(ctx context.Context, images []string) (err error) {
 		}
 	}
 
+	return nil
+}
+
+func cosignSignClaimVerifier(sig oci.Signature, imageDigest v1.Hash, annotations map[string]any) error {
+	if err := cosign.IntotoSubjectClaimVerifier(sig, imageDigest, annotations); err != nil {
+		return err
+	}
+	p, err := sig.Payload()
+	if err != nil {
+		return err
+	}
+	var env dsse.Envelope
+	if err := json.Unmarshal(p, &env); err != nil {
+		return err
+	}
+	st := &attestation.Statement{}
+	if err := st.UnmarshalJSON(env.Payload); err != nil {
+		return err
+	}
+	if st.PredicateType != types.CosignSignPredicateType {
+		return fmt.Errorf("unexpected predicate type %q: expected %q (use cosign verify-attestation for attestations)", st.PredicateType, types.CosignSignPredicateType)
+	}
 	return nil
 }
 

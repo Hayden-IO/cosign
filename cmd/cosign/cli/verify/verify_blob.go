@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,7 +29,7 @@ import (
 	"github.com/sigstore/cosign/v3/internal/ui"
 	"github.com/sigstore/cosign/v3/pkg/blob"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
-	sgbundle "github.com/sigstore/sigstore-go/pkg/bundle"
+	cbundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle"
 	sgverify "github.com/sigstore/sigstore-go/pkg/verify"
 )
 
@@ -46,6 +47,7 @@ type VerifyBlobCmd struct {
 	UseSignedTimestamps          bool
 	IgnoreTlog                   bool
 	AllowCertificateChain        bool
+	PQCOnly                      bool
 }
 
 // nolint
@@ -58,6 +60,13 @@ func (c *VerifyBlobCmd) Exec(ctx context.Context, blobRef string) error {
 	// Key and sk are mutually exclusive.
 	if options.NOf(c.KeyRef, c.Sk) > 1 {
 		return &options.PubKeyParseError{}
+	}
+
+	if c.PQCOnly {
+		if err := ValidatePQCOnlyFlags(c.IgnoreTlog, c.Sk, c.UseSignedTimestamps); err != nil {
+			return err
+		}
+		WarnExperimentalPQCOnly(ctx)
 	}
 
 	var identities []cosign.Identity
@@ -80,17 +89,28 @@ func (c *VerifyBlobCmd) Exec(ctx context.Context, blobRef string) error {
 		IgnoreTlog:                   c.IgnoreTlog,
 		UseSignedTimestamps:          c.UseSignedTimestamps,
 		AllowCertificateChain:        c.AllowCertificateChain,
+		PQCOnly:                      c.PQCOnly,
 	}
 	vOfflineKey := verifyOfflineWithKey(c.KeyRef, c.Sk, co)
 
 	// User provides a key. Otherwise, verification requires a Fulcio certificate
-	// provided in an attached bundle.
+	// or OIDC transparency log identity provided in an attached bundle.
 	var closeSV func()
 	co.SigVerifier, closeSV, err = LoadVerifierFromKey(ctx, c.KeyRef, c.Slot, c.Sk)
 	if err != nil {
 		return fmt.Errorf("loading verifier from key opts: %w", err)
 	}
 	defer closeSV()
+
+	if c.PQCOnly {
+		if err := ValidatePQCOnlyVerifier(co.SigVerifier); err != nil {
+			return err
+		}
+	}
+
+	if c.BundlePath == "" {
+		return errors.New("bundle path is required")
+	}
 
 	err = SetTrustedMaterial(c.TrustedRootPath, vOfflineKey, co)
 	if err != nil {
@@ -100,7 +120,7 @@ func (c *VerifyBlobCmd) Exec(ctx context.Context, blobRef string) error {
 		return fmt.Errorf("a trusted root is required for verification; provide one via --trusted-root")
 	}
 
-	bundle, err := sgbundle.LoadJSONFromPath(c.BundlePath, co.BundleOptions()...)
+	loaded, err := cbundle.LoadBundleFromPath(c.BundlePath, co.BundleOptions()...)
 	if err != nil {
 		return err
 	}
@@ -117,7 +137,17 @@ func (c *VerifyBlobCmd) Exec(ctx context.Context, blobRef string) error {
 		artifactPolicyOption = sgverify.WithArtifact(bytes.NewReader(blobBytes))
 	}
 
-	_, err = cosign.VerifyNewBundle(ctx, co, artifactPolicyOption, bundle)
+	switch {
+	case loaded.IsV1():
+		_, err = cosign.VerifyNewBundle(ctx, co, artifactPolicyOption, loaded.V1)
+	case loaded.IsV2():
+		if loaded.V2.HasEnvelope() {
+			return errors.New("bundle contains a DSSE envelope; use cosign verify-blob-attestation to verify attestations")
+		}
+		_, err = cosign.VerifyBundleV2(ctx, co, artifactPolicyOption, loaded.V2)
+	default:
+		return errors.New("empty bundle")
+	}
 	if err != nil {
 		return err
 	}

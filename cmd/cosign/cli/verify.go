@@ -122,7 +122,7 @@ against the transparency log.`,
 			ctx, cancel := context.WithTimeout(cmd.Context(), ro.Timeout)
 			defer cancel()
 
-			if o.CommonVerifyOptions.IgnoreTlog && !o.CommonVerifyOptions.PrivateInfrastructure {
+			if o.CommonVerifyOptions.IgnoreTlog && !o.CommonVerifyOptions.PrivateInfrastructure && !o.CommonVerifyOptions.ExperimentalPQCOnly {
 				ui.Warnf(ctx, ignoreTLogMessage, "signature")
 			}
 
@@ -218,7 +218,7 @@ against the transparency log.`,
 			ctx, cancel := context.WithTimeout(cmd.Context(), ro.Timeout)
 			defer cancel()
 
-			if o.CommonVerifyOptions.IgnoreTlog && !o.CommonVerifyOptions.PrivateInfrastructure {
+			if o.CommonVerifyOptions.IgnoreTlog && !o.CommonVerifyOptions.PrivateInfrastructure && !o.CommonVerifyOptions.ExperimentalPQCOnly {
 				ui.Warnf(ctx, ignoreTLogMessage, "attestation")
 			}
 
@@ -299,12 +299,13 @@ The blob may be specified as a path to a file or - for stdin.`,
 				UseSignedTimestamps:          o.CommonVerifyOptions.UseSignedTimestamps,
 				TrustedRootPath:              o.CommonVerifyOptions.TrustedRootPath,
 				AllowCertificateChain:        o.CommonVerifyOptions.AllowCertificateChain,
+				PQCOnly:                      o.CommonVerifyOptions.ExperimentalPQCOnly,
 			}
 
 			ctx, cancel := context.WithTimeout(cmd.Context(), ro.Timeout)
 			defer cancel()
 
-			if o.CommonVerifyOptions.IgnoreTlog && !o.CommonVerifyOptions.PrivateInfrastructure {
+			if o.CommonVerifyOptions.IgnoreTlog && !o.CommonVerifyOptions.PrivateInfrastructure && !o.CommonVerifyOptions.ExperimentalPQCOnly {
 				ui.Warnf(ctx, ignoreTLogMessage, "blob")
 			}
 
@@ -381,6 +382,7 @@ The blob may be specified as a path to a file.`,
 				Digest:                       o.Digest,
 				DigestAlg:                    o.DigestAlg,
 				AllowCertificateChain:        o.CommonVerifyOptions.AllowCertificateChain,
+				PQCOnly:                      o.CommonVerifyOptions.ExperimentalPQCOnly,
 			}
 			// We only use the blob if we are checking claims.
 			if o.CheckClaims && len(args) == 0 && (o.Digest == "" || o.DigestAlg == "") {
@@ -394,7 +396,7 @@ The blob may be specified as a path to a file.`,
 			ctx, cancel := context.WithTimeout(cmd.Context(), ro.Timeout)
 			defer cancel()
 
-			if o.CommonVerifyOptions.IgnoreTlog && !o.CommonVerifyOptions.PrivateInfrastructure {
+			if o.CommonVerifyOptions.IgnoreTlog && !o.CommonVerifyOptions.PrivateInfrastructure && !o.CommonVerifyOptions.ExperimentalPQCOnly {
 				ui.Warnf(ctx, ignoreTLogMessage, "blob attestation")
 			}
 

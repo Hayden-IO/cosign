@@ -18,10 +18,12 @@ package verify
 import (
 	"bytes"
 	"context"
+	"crypto/mldsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/secure-systems-lab/go-securesystemslib/dsse"
@@ -90,6 +92,13 @@ func AssembleNewBundleFromPayload(ctx context.Context, payload, sigBytes, signed
 	}
 
 	if cert != nil {
+		if _, isMLDSA := cert.PublicKey.(*mldsa.PublicKey); isMLDSA {
+			return nil, errors.New("ML-DSA certificates are not supported for v1 bundles")
+		}
+		switch cert.SignatureAlgorithm {
+		case x509.MLDSA44, x509.MLDSA65, x509.MLDSA87:
+			return nil, errors.New("ML-DSA certificates are not supported for v1 bundles")
+		}
 		pb.VerificationMaterial.Content = &protobundle.VerificationMaterial_Certificate{
 			Certificate: &protocommon.X509Certificate{
 				RawBytes: cert.Raw,
@@ -99,6 +108,9 @@ func AssembleNewBundleFromPayload(ctx context.Context, payload, sigBytes, signed
 		pub, err := sigVerifier.PublicKey(pkOpts...)
 		if err != nil {
 			return nil, err
+		}
+		if _, isMLDSA := pub.(*mldsa.PublicKey); isMLDSA {
+			return nil, errors.New("ML-DSA public keys are not supported for v1 bundles")
 		}
 		pubKeyBytes, err := x509.MarshalPKIXPublicKey(pub)
 		if err != nil {
