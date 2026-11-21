@@ -26,7 +26,10 @@ type (
 	RFC3161Timestamp = types.RFC3161Timestamp
 )
 
-const BundleV03MediaType = types.BundleV03MediaType
+const (
+	BundleV03MediaType = types.BundleV03MediaType
+	BundleV20MediaType = types.BundleV20MediaType
+)
 
 // TimestampToRFC3161Timestamp receives a base64 encoded RFC3161 timestamp.
 func TimestampToRFC3161Timestamp(timestampRFC3161 []byte) *RFC3161Timestamp {

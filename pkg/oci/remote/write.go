@@ -34,7 +34,6 @@ import (
 	bundle "github.com/sigstore/cosign/v3/pkg/cosign/bundle/types"
 	"github.com/sigstore/cosign/v3/pkg/oci"
 	ctypes "github.com/sigstore/cosign/v3/pkg/types"
-	sgbundle "github.com/sigstore/sigstore-go/pkg/bundle"
 )
 
 const BundlePredicateType string = "dev.sigstore.bundle.predicateType"
@@ -400,11 +399,46 @@ func WriteReferrer(d name.Digest, artifactType string, layers []v1.Layer, annota
 	return nil
 }
 
+const legacyBundleV03MediaType = "application/vnd.dev.sigstore.bundle+json;version=0.3"
+
+func detectBundleMediaType(bundleBytes []byte) (string, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(bundleBytes, &raw); err != nil {
+		// Preserve backwards compatibility for callers/tests passing non-JSON
+		// placeholder payloads (e.g. pkg/cosign/verify_oci_test.go).
+		return bundle.BundleV03MediaType, nil
+	}
+	mtRaw, hasCamel := raw["mediaType"]
+	mtSnake, hasSnake := raw["media_type"]
+	if hasCamel && hasSnake {
+		return "", fmt.Errorf("bundle contains both mediaType and media_type fields")
+	}
+	if !hasCamel && !hasSnake {
+		// Default to v0.3 when mediaType is omitted (backwards compatibility).
+		return bundle.BundleV03MediaType, nil
+	}
+	if !hasCamel {
+		mtRaw = mtSnake
+	}
+	var mediaType string
+	if err := json.Unmarshal(mtRaw, &mediaType); err != nil || mediaType == "" {
+		return "", fmt.Errorf("invalid bundle mediaType field")
+	}
+	switch mediaType {
+	case bundle.BundleV03MediaType, legacyBundleV03MediaType:
+		// Normalize legacy parameter-form v0.3 to the OCI-safe v0.3 media type.
+		return bundle.BundleV03MediaType, nil
+	case bundle.BundleV20MediaType:
+		return bundle.BundleV20MediaType, nil
+	default:
+		return "", fmt.Errorf("unsupported bundle media type: %s", mediaType)
+	}
+}
+
 func WriteAttestationNewBundleFormat(d name.Digest, bundleBytes []byte, predicateType string, opts ...Option) error {
-	// generate bundle media type string
-	bundleMediaType, err := sgbundle.MediaTypeString("0.3")
+	bundleMediaType, err := detectBundleMediaType(bundleBytes)
 	if err != nil {
-		return fmt.Errorf("failed to generate bundle media type string: %w", err)
+		return fmt.Errorf("failed to determine bundle media type string: %w", err)
 	}
 
 	// Write the bundle layer

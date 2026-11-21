@@ -277,6 +277,149 @@ func TestWriteAttestationNewBundleFormat(t *testing.T) {
 	}
 }
 
+func TestWriteAttestationNewBundleFormat_MediaTypes(t *testing.T) {
+	origHead := remoteHead
+	origWriteLayer := remoteWriteLayer
+	origPut := remotePut
+	t.Cleanup(func() {
+		remoteHead = origHead
+		remoteWriteLayer = origWriteLayer
+		remotePut = origPut
+	})
+
+	digest := name.MustParseReference("gcr.io/test/image@sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").(name.Digest)
+	predicateType := "https://sigstore.dev/cosign/sign/v1"
+
+	remoteHead = func(name.Reference, ...remote.Option) (*v1.Descriptor, error) {
+		return &v1.Descriptor{
+			MediaType: types.DockerManifestSchema2,
+			Digest:    v1.Hash{Algorithm: "sha256", Hex: "abcdef1234567890"},
+			Size:      100,
+		}, nil
+	}
+	remoteWriteLayer = func(name.Repository, v1.Layer, ...remote.Option) error {
+		return nil
+	}
+
+	testCases := []struct {
+		name          string
+		bundleBytes   []byte
+		wantMediaType string
+		wantErr       bool
+		wantErrSubstr string
+	}{
+		{
+			name:          "bundle v2.0 uses v2.0 media type and artifactType",
+			bundleBytes:   []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle.v2.0+json","verificationMaterial":{}}`),
+			wantMediaType: bundle.BundleV20MediaType,
+		},
+		{
+			name:          "bundle v2.0 with snake_case media_type uses v2.0 media type",
+			bundleBytes:   []byte(`{"media_type":"application/vnd.dev.sigstore.bundle.v2.0+json","verification_material":{}}`),
+			wantMediaType: bundle.BundleV20MediaType,
+		},
+		{
+			name:          "conflicting mediaType and media_type fails closed",
+			bundleBytes:   []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json","media_type":"application/vnd.dev.sigstore.bundle.v2.0+json"}`),
+			wantErr:       true,
+			wantErrSubstr: "both mediaType and media_type",
+		},
+		{
+			name:          "bundle v0.3 uses v0.3 media type and artifactType",
+			bundleBytes:   []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json","verificationMaterial":{}}`),
+			wantMediaType: bundle.BundleV03MediaType,
+		},
+		{
+			name:          "legacy parameter-form v0.3 normalizes to OCI-safe v0.3 media type",
+			bundleBytes:   []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3","verificationMaterial":{}}`),
+			wantMediaType: bundle.BundleV03MediaType,
+		},
+		{
+			name:          "missing mediaType defaults to v0.3",
+			bundleBytes:   []byte(`{"payload":"test"}`),
+			wantMediaType: bundle.BundleV03MediaType,
+		},
+		{
+			name:          "v0.1 bundle rejected",
+			bundleBytes:   []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.1"}`),
+			wantErr:       true,
+			wantErrSubstr: "unsupported bundle media type",
+		},
+		{
+			name:          "unsupported mediaType fails closed",
+			bundleBytes:   []byte(`{"mediaType":"application/vnd.dev.sigstore.bundle.v9.9+json"}`),
+			wantErr:       true,
+			wantErrSubstr: "unsupported bundle media type",
+		},
+		{
+			name:          "non-string mediaType fails closed",
+			bundleBytes:   []byte(`{"mediaType":123}`),
+			wantErr:       true,
+			wantErrSubstr: "invalid bundle mediaType field",
+		},
+		{
+			name:          "empty string mediaType fails closed",
+			bundleBytes:   []byte(`{"mediaType":""}`),
+			wantErr:       true,
+			wantErrSubstr: "invalid bundle mediaType field",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var capturedManifest remote.Taggable
+			remotePut = func(_ name.Reference, manifest remote.Taggable, _ ...remote.Option) error {
+				capturedManifest = manifest
+				return nil
+			}
+
+			err := WriteAttestationNewBundleFormat(digest, tc.bundleBytes, predicateType)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Fatalf("expected error containing %q, got %v", tc.wantErrSubstr, err)
+				}
+				if capturedManifest != nil {
+					t.Fatal("expected remotePut not to be called on error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("WriteAttestationNewBundleFormat: %v", err)
+			}
+			refManifest, ok := capturedManifest.(referrerManifest)
+			if !ok {
+				t.Fatalf("expected referrerManifest, got %T", capturedManifest)
+			}
+			if refManifest.ArtifactType != tc.wantMediaType {
+				t.Errorf("manifest ArtifactType = %q, want %q", refManifest.ArtifactType, tc.wantMediaType)
+			}
+			if refManifest.Config.ArtifactType != tc.wantMediaType {
+				t.Errorf("config ArtifactType = %q, want %q", refManifest.Config.ArtifactType, tc.wantMediaType)
+			}
+			rawJSON, err := refManifest.RawManifest()
+			if err != nil {
+				t.Fatalf("RawManifest: %v", err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(rawJSON, &decoded); err != nil {
+				t.Fatalf("json.Unmarshal(RawManifest): %v", err)
+			}
+			if decoded["artifactType"] != tc.wantMediaType {
+				t.Errorf("RawManifest artifactType = %v, want %q", decoded["artifactType"], tc.wantMediaType)
+			}
+			if len(refManifest.Layers) != 1 {
+				t.Fatalf("expected 1 layer, got %d", len(refManifest.Layers))
+			}
+			if string(refManifest.Layers[0].MediaType) != tc.wantMediaType {
+				t.Errorf("layer MediaType = %q, want %q", refManifest.Layers[0].MediaType, tc.wantMediaType)
+			}
+		})
+	}
+}
+
 func TestWriteAttestationsReferrer(t *testing.T) {
 	// Save original functions
 	origHead := remoteHead

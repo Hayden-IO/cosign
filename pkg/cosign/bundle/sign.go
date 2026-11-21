@@ -17,16 +17,20 @@ package bundle
 import (
 	"bytes"
 	"context"
+	"crypto/mldsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"reflect"
 	"sync"
 	"time"
 
 	"github.com/sigstore/cosign/v3/internal/ui"
 	"github.com/sigstore/cosign/v3/internal/useragent"
+	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/sign"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
@@ -39,7 +43,101 @@ type SignOptions struct {
 	CertificateProvider sign.CertificateProvider
 }
 
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Slice, reflect.Map, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+func isMLDSASigningAlgorithm(alg protocommon.PublicKeyDetails) bool {
+	switch alg {
+	case protocommon.PublicKeyDetails_ML_DSA_44,
+		protocommon.PublicKeyDetails_ML_DSA_65,
+		protocommon.PublicKeyDetails_ML_DSA_87:
+		return true
+	default:
+		return false
+	}
+}
+
+func rejectMLDSAKeypairForV1(keypair sign.Keypair) error {
+	if isNilValue(keypair) {
+		return nil
+	}
+	if _, isMLDSA := keypair.GetPublicKey().(*mldsa.PublicKey); isMLDSA {
+		return errors.New("ML-DSA keys are not supported for v1 bundles; use --experimental-pqc to sign with a v2 bundle")
+	}
+	if isMLDSASigningAlgorithm(keypair.GetSigningAlgorithm()) {
+		return errors.New("ML-DSA keys are not supported for v1 bundles; use --experimental-pqc to sign with a v2 bundle")
+	}
+	if keypair.GetPublicKey() == nil {
+		if pubPEM, err := keypair.GetPublicKeyPem(); err == nil && pubPEM != "" {
+			if block, _ := pem.Decode([]byte(pubPEM)); block != nil {
+				if pubKey, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+					if _, isMLDSA := pubKey.(*mldsa.PublicKey); isMLDSA {
+						return errors.New("ML-DSA keys are not supported for v1 bundles; use --experimental-pqc to sign with a v2 bundle")
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func isMLDSACert(c *x509.Certificate) bool {
+	if c == nil {
+		return false
+	}
+	if _, ok := c.PublicKey.(*mldsa.PublicKey); ok {
+		return true
+	}
+	switch c.SignatureAlgorithm {
+	case x509.MLDSA44, x509.MLDSA65, x509.MLDSA87:
+		return true
+	}
+	return false
+}
+
+func rejectMLDSACertForV1(certPEM []byte) error {
+	rest := certPEM
+	for len(rest) > 0 {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			continue
+		}
+		if isMLDSACert(c) {
+			return errors.New("ML-DSA certificates are not supported for v1 bundles; use --experimental-pqc to sign with a v2 bundle")
+		}
+	}
+	return nil
+}
+
 func SignData(ctx context.Context, content sign.Content, keypair sign.Keypair, idToken string, cert []byte, certChain []byte, signingConfig *root.SigningConfig, trustedMaterial root.TrustedMaterial, opts SignOptions) ([]byte, error) {
+	if err := rejectMLDSAKeypairForV1(keypair); err != nil {
+		return nil, err
+	}
+	if err := rejectMLDSACertForV1(cert); err != nil {
+		return nil, err
+	}
+	if err := rejectMLDSACertForV1(certChain); err != nil {
+		return nil, err
+	}
+
 	var bundleOpts sign.BundleOptions
 
 	if trustedMaterial != nil {
@@ -73,13 +171,19 @@ func SignData(ctx context.Context, content sign.Content, keypair sign.Keypair, i
 			return nil, err
 		}
 		block, _ := pem.Decode([]byte(publicKeyPem))
+		if block == nil {
+			return nil, errors.New("failed to decode public key PEM")
+		}
 		pubKey, err := x509.ParsePKIXPublicKey(block.Bytes)
 		if err != nil {
-			log.Fatal(err)
+			return nil, fmt.Errorf("parsing public key: %w", err)
+		}
+		if _, isMLDSA := pubKey.(*mldsa.PublicKey); isMLDSA {
+			return nil, errors.New("ML-DSA keys are not supported for v1 bundles; use --experimental-pqc to sign with a v2 bundle")
 		}
 		verifier, err := signature.LoadDefaultVerifier(pubKey)
 		if err != nil {
-			log.Fatal(err)
+			return nil, fmt.Errorf("loading verifier: %w", err)
 		}
 		key := root.NewExpiringKey(verifier, time.Time{}, time.Time{})
 		keyTrustedMaterial := root.NewTrustedPublicKeyMaterial(func(_ string) (root.TimeConstrainedVerifier, error) {
@@ -151,7 +255,101 @@ func SignData(ctx context.Context, content sign.Content, keypair sign.Keypair, i
 	if err != nil {
 		return nil, fmt.Errorf("error signing bundle: %w", err)
 	}
+	if vm := bundle.GetVerificationMaterial(); vm != nil {
+		if cert := vm.GetCertificate(); cert != nil && len(cert.RawBytes) > 0 {
+			if c, err := x509.ParseCertificate(cert.RawBytes); err == nil && isMLDSACert(c) {
+				return nil, errors.New("ML-DSA certificates are not supported for v1 bundles; use --experimental-pqc to sign with a v2 bundle")
+			}
+		}
+		for _, cert := range vm.GetX509CertificateChain().GetCertificates() {
+			if cert != nil && len(cert.RawBytes) > 0 {
+				if c, err := x509.ParseCertificate(cert.RawBytes); err == nil && isMLDSACert(c) {
+					return nil, errors.New("ML-DSA certificates are not supported for v1 bundles; use --experimental-pqc to sign with a v2 bundle")
+				}
+			}
+		}
+	}
 	return protojson.Marshal(bundle)
+}
+
+// SignIdentityData creates a Bundle v2 using the transparent PQC identity flow
+// (Rekor v3) with either an OIDC token or an ML-DSA-44 public key credential.
+func SignIdentityData(ctx context.Context, content sign.Content, cred sign.IdentityCredential, signingConfig *root.SigningConfig, trustedMaterial root.TrustedMaterial) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if isNilValue(content) {
+		return nil, errors.New("content must not be nil")
+	}
+	if isNilValue(cred) {
+		return nil, errors.New("credential must not be nil")
+	}
+	if signingConfig == nil {
+		return nil, errors.New("signing config is required for PQC transparent signing")
+	}
+	if trustedMaterial != nil && isNilValue(trustedMaterial) {
+		return nil, errors.New("trusted material must not be nil")
+	}
+
+	rekorURLs := signingConfig.RekorLogURLs()
+	if len(rekorURLs) == 0 {
+		return nil, errors.New("no Rekor v3 transparency log configured in signing config")
+	}
+	rekorSvc, err := root.SelectService(rekorURLs, sign.IdentityRekorAPIVersions, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("selecting Rekor v3 transparency log: %w", err)
+	}
+
+	rekorClient := sign.NewIdentityRekorClient(
+		rekorSvc.URL,
+		sign.WithIdentityRekorTimeout(90*time.Second),
+		sign.WithIdentityRekorRetries(1),
+		sign.WithIdentityRekorUserAgent(useragent.Get()),
+	)
+
+	bundleOpts := sign.IdentityBundleOptions{
+		TransparencyLog: rekorClient,
+		Context:         ctx,
+		TrustedRoot:     trustedMaterial,
+	}
+
+	if pkCred, ok := cred.(*sign.PublicKeyCredential); ok {
+		if pkCred == nil || isNilValue(pkCred.Keypair) {
+			return nil, errors.New("public key credential keypair must not be nil")
+		}
+		pubKey := pkCred.Keypair.GetPublicKey()
+		mldsaPub, ok := pubKey.(*mldsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("PQC transparent signing requires an ML-DSA-44 key, got %T", pubKey)
+		}
+		params, err := cryptoutils.ValidateMLDSAPublicKey(mldsaPub)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ML-DSA public key: %w", err)
+		}
+		if params != mldsa.MLDSA44() {
+			return nil, fmt.Errorf("unsupported ML-DSA parameters %s: only mldsa-44 is currently supported for transparent signing; mldsa-65 and mldsa-87 will be supported in the future for non-transparent signatures", params)
+		}
+		if trustedMaterial != nil {
+			verifier, err := signature.LoadDefaultVerifier(mldsaPub)
+			if err != nil {
+				return nil, fmt.Errorf("loading ML-DSA verifier: %w", err)
+			}
+			key := root.NewExpiringKey(verifier, time.Time{}, time.Time{})
+			bundleOpts.TrustedRoot = &verifyTrustedMaterial{
+				TrustedMaterial:    trustedMaterial,
+				keyTrustedMaterial: root.NewTrustedPublicKeyVerifiers(key),
+			}
+		}
+	}
+
+	spinner := ui.NewSpinner(ctx, "Signing artifact...")
+	defer spinner.Stop()
+
+	b, err := sign.IdentityBundle(content, cred, bundleOpts)
+	if err != nil {
+		return nil, fmt.Errorf("error signing identity bundle: %w", err)
+	}
+	return protojson.Marshal(b)
 }
 
 type verifyTrustedMaterial struct {

@@ -14,4 +14,7 @@
 
 package types
 
-const BundleV03MediaType = "application/vnd.dev.sigstore.bundle.v0.3+json"
+const (
+	BundleV03MediaType = "application/vnd.dev.sigstore.bundle.v0.3+json"
+	BundleV20MediaType = "application/vnd.dev.sigstore.bundle.v2.0+json"
+)
